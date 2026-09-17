@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -13,9 +15,23 @@ from psycopg.types.json import Jsonb
 DATABASE_URL = os.environ["DATABASE_URL"]
 
 
+def _ipv4_hostaddr(url: str) -> str | None:
+    host = urlparse(url).hostname
+    try:
+        infos = socket.getaddrinfo(host, 5432, socket.AF_INET, socket.SOCK_STREAM)
+        return infos[0][4][0] if infos else None
+    except socket.gaierror:
+        return None
+
+
 @contextmanager
 def conn():
-    with psycopg.connect(DATABASE_URL, autocommit=False, options="-c search_path=kalshi,public") as c:
+    kwargs = {"autocommit": False}
+    if (addr := _ipv4_hostaddr(DATABASE_URL)):
+        kwargs["hostaddr"] = addr          # force IPv4; SNI/TLS still uses the hostname
+    with psycopg.connect(DATABASE_URL, **kwargs) as c:
+        with c.cursor() as cur:
+            cur.execute("SET search_path TO kalshi, public")
         yield c
 
 
