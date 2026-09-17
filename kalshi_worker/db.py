@@ -57,13 +57,12 @@ def upsert_series(c, rows: Iterable[dict]) -> int:
     ON CONFLICT (ticker) DO UPDATE SET title=EXCLUDED.title, category=EXCLUDED.category,
       frequency=EXCLUDED.frequency, settlement_sources=EXCLUDED.settlement_sources,
       tags=EXCLUDED.tags, raw=EXCLUDED.raw, updated_at=now()"""
-    n = 0
-    with c.cursor() as cur:
-        for s in rows:
-            cur.execute(sql, (s["ticker"], s.get("title"), s.get("category"), s.get("frequency"),
-                              Jsonb(s.get("settlement_sources")), s.get("tags"), Jsonb(s)))
-            n += 1
-    return n
+    params = [(s["ticker"], s.get("title"), s.get("category"), s.get("frequency"),
+               Jsonb(s.get("settlement_sources")), s.get("tags"), Jsonb(s)) for s in rows]
+    if params:
+        with c.cursor() as cur:
+            cur.executemany(sql, params)
+    return len(params)
 
 
 def upsert_events(c, rows: Iterable[dict]) -> int:
@@ -74,14 +73,13 @@ def upsert_events(c, rows: Iterable[dict]) -> int:
     ON CONFLICT (event_ticker) DO UPDATE SET series_ticker=EXCLUDED.series_ticker, title=EXCLUDED.title,
       sub_title=EXCLUDED.sub_title, category=EXCLUDED.category, mutually_exclusive=EXCLUDED.mutually_exclusive,
       strike_date=EXCLUDED.strike_date, strike_period=EXCLUDED.strike_period, raw=EXCLUDED.raw, updated_at=now()"""
-    n = 0
-    with c.cursor() as cur:
-        for e in rows:
-            cur.execute(sql, (e["event_ticker"], e.get("series_ticker"), e.get("title"), e.get("sub_title"),
-                              e.get("category"), e.get("mutually_exclusive"), _ts(e.get("strike_date")),
-                              e.get("strike_period"), Jsonb(e)))
-            n += 1
-    return n
+    params = [(e["event_ticker"], e.get("series_ticker"), e.get("title"), e.get("sub_title"),
+               e.get("category"), e.get("mutually_exclusive"), _ts(e.get("strike_date")),
+               e.get("strike_period"), Jsonb(e)) for e in rows]
+    if params:
+        with c.cursor() as cur:
+            cur.executemany(sql, params)
+    return len(params)
 
 
 def upsert_markets(c, rows: Iterable[dict]) -> int:
@@ -107,25 +105,26 @@ def upsert_markets(c, rows: Iterable[dict]) -> int:
       last_price=EXCLUDED.last_price, volume=EXCLUDED.volume, open_interest=EXCLUDED.open_interest,
       settlement_value=EXCLUDED.settlement_value, expiration_value=EXCLUDED.expiration_value,
       raw=EXCLUDED.raw, updated_at=now()"""
-    n = 0
-    with c.cursor() as cur:
-        for m in rows:
-            ev = m.get("event_ticker") or ""
-            series = m.get("series_ticker") or (ev.rsplit("-", 1)[0] if "-" in ev else None)
-            cur.execute(sql, (
-                m["ticker"], ev or None, series, m.get("market_type"), m.get("title"), m.get("subtitle"),
-                m.get("yes_sub_title"), m.get("no_sub_title"), m.get("rules_primary"), m.get("rules_secondary"),
-                m.get("status"), m.get("result", ""), _ts(m.get("created_time")), _ts(m.get("updated_time")),
-                _ts(m.get("open_time")), _ts(m.get("close_time")), _ts(m.get("expiration_time")),
-                _ts(m.get("expected_expiration_time")), _ts(m.get("latest_expiration_time")),
-                _ts(m.get("settlement_ts")), m.get("can_close_early"), m.get("strike_type"),
-                m.get("floor_strike"), m.get("cap_strike"),
-                _num(m.get("yes_bid_dollars")), _num(m.get("yes_ask_dollars")),
-                _num(m.get("no_bid_dollars")), _num(m.get("no_ask_dollars")), _num(m.get("last_price_dollars")),
-                _num(m.get("volume_fp")), _num(m.get("open_interest_fp")),
-                _num(m.get("settlement_value_dollars")), m.get("expiration_value"), Jsonb(m)))
-            n += 1
-    return n
+    params = []
+    for m in rows:
+        ev = m.get("event_ticker") or ""
+        series = m.get("series_ticker") or (ev.rsplit("-", 1)[0] if "-" in ev else None)
+        params.append((
+            m["ticker"], ev or None, series, m.get("market_type"), m.get("title"), m.get("subtitle"),
+            m.get("yes_sub_title"), m.get("no_sub_title"), m.get("rules_primary"), m.get("rules_secondary"),
+            m.get("status"), m.get("result", ""), _ts(m.get("created_time")), _ts(m.get("updated_time")),
+            _ts(m.get("open_time")), _ts(m.get("close_time")), _ts(m.get("expiration_time")),
+            _ts(m.get("expected_expiration_time")), _ts(m.get("latest_expiration_time")),
+            _ts(m.get("settlement_ts")), m.get("can_close_early"), m.get("strike_type"),
+            m.get("floor_strike"), m.get("cap_strike"),
+            _num(m.get("yes_bid_dollars")), _num(m.get("yes_ask_dollars")),
+            _num(m.get("no_bid_dollars")), _num(m.get("no_ask_dollars")), _num(m.get("last_price_dollars")),
+            _num(m.get("volume_fp")), _num(m.get("open_interest_fp")),
+            _num(m.get("settlement_value_dollars")), m.get("expiration_value"), Jsonb(m)))
+    if params:
+        with c.cursor() as cur:
+            cur.executemany(sql, params)
+    return len(params)
 
 
 # ------------------------------------------------------------- time series
@@ -146,46 +145,47 @@ def insert_candles(c, ticker: str, period: int, candles: Iterable[dict]) -> int:
       price_close=EXCLUDED.price_close, price_mean=EXCLUDED.price_mean, yes_bid_close=EXCLUDED.yes_bid_close,
       yes_ask_close=EXCLUDED.yes_ask_close, volume=EXCLUDED.volume, open_interest=EXCLUDED.open_interest,
       raw=EXCLUDED.raw"""
-    n = 0
-    with c.cursor() as cur:
-        for k in candles:
-            p, yb, ya = k.get("price") or {}, k.get("yes_bid") or {}, k.get("yes_ask") or {}
-            cur.execute(sql, (ticker, period, _ts(k["end_period_ts"]), _d(p, "open"), _d(p, "high"),
-                              _d(p, "low"), _d(p, "close"), _d(p, "mean"), _d(yb, "close"), _d(ya, "close"),
-                              _num(k.get("volume_fp", k.get("volume"))),
-                              _num(k.get("open_interest_fp", k.get("open_interest"))), Jsonb(k)))
-            n += 1
-    return n
+    params = []
+    for k in candles:
+        p, yb, ya = k.get("price") or {}, k.get("yes_bid") or {}, k.get("yes_ask") or {}
+        params.append((ticker, period, _ts(k["end_period_ts"]), _d(p, "open"), _d(p, "high"),
+                       _d(p, "low"), _d(p, "close"), _d(p, "mean"), _d(yb, "close"), _d(ya, "close"),
+                       _num(k.get("volume_fp", k.get("volume"))),
+                       _num(k.get("open_interest_fp", k.get("open_interest"))), Jsonb(k)))
+    if params:
+        with c.cursor() as cur:
+            cur.executemany(sql, params)
+    return len(params)
 
 
 def insert_trades(c, trades: Iterable[dict]) -> int:
     sql = """
     INSERT INTO trades (trade_id, ticker, ts, yes_price, no_price, count, taker_side, is_block_trade, raw)
     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (trade_id) DO NOTHING"""
-    n = 0
-    with c.cursor() as cur:
-        for t in trades:
-            cur.execute(sql, (t["trade_id"], t["ticker"], _ts(t.get("created_time")),
-                              _num(t.get("yes_price_dollars")), _num(t.get("no_price_dollars")),
-                              _num(t.get("count_fp", t.get("count"))), t.get("taker_side"),
-                              t.get("is_block_trade"), Jsonb(t)))
-            n += 1
-    return n
+    params = [(t["trade_id"], t["ticker"], _ts(t.get("created_time")),
+               _num(t.get("yes_price_dollars")), _num(t.get("no_price_dollars")),
+               _num(t.get("count_fp", t.get("count"))), t.get("taker_side"),
+               t.get("is_block_trade"), Jsonb(t)) for t in trades]
+    if params:
+        with c.cursor() as cur:
+            cur.executemany(sql, params)
+    return len(params)
 
 
 def insert_book(c, ticker: str, ts: datetime, book: dict) -> int:
     """Kalshi returns yes bids and no bids as [[price, count], ...]. Prefer *_dollars keys."""
     sql = """INSERT INTO book_snapshots (ticker, ts, side, price, quantity)
              VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING"""
-    n = 0
-    with c.cursor() as cur:
-        for side in ("yes", "no"):
-            levels = book.get(f"{side}_dollars") or book.get(side) or []
-            for level in levels:
-                price, qty = level[0], level[1]
-                cur.execute(sql, (ticker, ts, side, _num(price), _num(qty)))
-                n += 1
-    return n
+    params = []
+    for side in ("yes", "no"):
+        levels = book.get(f"{side}_dollars") or book.get(side) or []
+        for level in levels:
+            price, qty = level[0], level[1]
+            params.append((ticker, ts, side, _num(price), _num(qty)))
+    if params:
+        with c.cursor() as cur:
+            cur.executemany(sql, params)
+    return len(params)
 
 
 # --------------------------------------------------------------- bookkeeping
