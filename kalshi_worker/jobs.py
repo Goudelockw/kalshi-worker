@@ -51,7 +51,7 @@ def load_candles(k: KalshiClient, c, m: dict, period: int, historical: bool, sin
     n = 0
     for s in range(start, end, step):
         e = min(s + step, end)
-        candles = k.candlesticks(m["ticker"], s, e, period, historical=historical)
+        candles = k.candlesticks(m["ticker"], s, e, period, historical=historical, series_ticker=m["series_ticker"])
         if candles:
             n += db.insert_candles(c, m["ticker"], period, candles)
     return n

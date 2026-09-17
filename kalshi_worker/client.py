@@ -96,8 +96,13 @@ class KalshiClient:
 
     # ------------------------------------------------------------- time series
     def candlesticks(self, ticker: str, start_ts: int, end_ts: int, period: int,
-                     historical: bool = False) -> list[dict]:
-        path = f"/historical/markets/{ticker}/candlesticks" if historical else f"/markets/{ticker}/candlesticks"
+                     historical: bool = False, series_ticker: str | None = None) -> list[dict]:
+        if historical:
+            path = f"/historical/markets/{ticker}/candlesticks"
+        else:
+            if not series_ticker:
+                raise ValueError("series_ticker is required for live candlesticks")
+            path = f"/series/{series_ticker}/markets/{ticker}/candlesticks"
         data = self.get(path, {"start_ts": start_ts, "end_ts": end_ts, "period_interval": period})
         return data.get("candlesticks") or []
 
