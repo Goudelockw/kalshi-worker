@@ -95,7 +95,8 @@ def backfill(k: KalshiClient, c, with_candles: bool = True) -> None:
         cutoff_ts = db._ts(cutoff.get("market_settled_ts") or cutoff.get("settled_ts"))
         st = db.get_state(c, "backfill_candles")
         done_through = st["meta"].get("done_through", "")
-        rows = _market_rows(c, "result <> '' AND ticker > %s ORDER BY ticker", (done_through,))
+        rows = _market_rows(c, "result <> '' AND ticker > %s AND ticker NOT LIKE %s ORDER BY ticker",
+                            (done_through, "KXMVE%"))
         log.info("backfilling daily candles for %d settled markets", len(rows))
         for i, m in enumerate(rows, 1):
             historical = bool(cutoff_ts and m["settled_time"] and m["settled_time"] < cutoff_ts)
@@ -130,8 +131,13 @@ def sync(k: KalshiClient, c) -> None:
         db.set_state(c, "sync_settled", watermark=_now() - timedelta(hours=1))
         c.commit()
 
-        # hourly candles for everything open, last 3 hours (overlap is fine: upsert)
-        for m in _market_rows(c, "status IN ('active','initialized','inactive')"):
+        # hourly candles, last 3 hours (overlap is fine: upsert), for open markets that are
+        # either in a watchlisted series or traded and closing within 14 days; no multivariate.
+        hourly_where = """status IN ('active','initialized','inactive')
+            AND ticker NOT LIKE %s
+            AND (series_ticker IN (SELECT series_ticker FROM watchlist)
+                 OR (volume > 0 AND close_time <= now() + interval '14 days'))"""
+        for m in _market_rows(c, hourly_where, ("KXMVE%",)):
             try:
                 stats["rows"] += load_candles(k, c, m, HOUR, False, since=_now() - timedelta(hours=3))
             except Exception as e:  # noqa: BLE001

@@ -107,6 +107,8 @@ def upsert_markets(c, rows: Iterable[dict]) -> int:
       raw=EXCLUDED.raw, updated_at=now()"""
     params = []
     for m in rows:
+        if m["ticker"].startswith("KXMVE"):
+            continue
         ev = m.get("event_ticker") or ""
         series = m.get("series_ticker") or (ev.rsplit("-", 1)[0] if "-" in ev else None)
         params.append((
