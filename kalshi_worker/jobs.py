@@ -121,6 +121,9 @@ def backfill(k: KalshiClient, c, with_candles: bool = True) -> None:
 
 
 # ------------------------------------------------------------------------------- sync
+OPEN = "status IN ('active','initialized','inactive')"
+
+
 def _sync_events(k: KalshiClient, c, **params) -> int:
     """Page /events with nested markets; upsert each event row, then its markets with
     series_ticker/event_ticker taken from the parent. Returns rows written."""
@@ -140,12 +143,44 @@ def _sync_events(k: KalshiClient, c, **params) -> int:
     return n
 
 
+def _open_markets(c, series: list[str]) -> list[dict]:
+    return _market_rows(c, f"series_ticker = ANY(%s) AND {OPEN}", (series,))
+
+
+def _batch_candles(k: KalshiClient, c, tickers: list[str], period: int, start_ts: int, end_ts: int) -> int:
+    """Candles for tickers sharing one window via the batch endpoint. Calls are sized so none
+    asks for more than BATCH_CANDLES candles: fewer tickers per call for long windows, and
+    time-sliced when a single ticker overflows. Failed calls are logged and skipped."""
+    if not tickers or start_ts >= end_ts:
+        return 0
+    per_ticker = (end_ts - start_ts) // (period * 60) + 1
+    size = max(1, min(k.BATCH_CANDLE_TICKERS, k.BATCH_CANDLES // per_ticker))
+    step = period * 60 * (k.BATCH_CANDLES // size - 1)  # inclusive range: N periods -> N+1 candles
+    n = 0
+    for i in range(0, len(tickers), size):
+        chunk = tickers[i:i + size]
+        for s in range(start_ts, end_ts, step):
+            try:
+                by_ticker = k.candlesticks_batch(chunk, s, min(s + step, end_ts), period)
+            except Exception as e:  # noqa: BLE001
+                log.warning("candles batch failed (%s..%s, period %d): %s", chunk[0], chunk[-1], period, e)
+                continue
+            for t, candles in by_ticker.items():
+                if candles:
+                    n += db.insert_candles(c, t, period, candles)
+            c.commit()
+    return n
+
+
 def sync(k: KalshiClient, c) -> None:
-    """Hourly: refresh open events/markets, ones closed or settled in the last 3 days,
-    hourly candles for in-scope open markets, and trades for watchlisted series."""
+    """Hourly: series; open events + markets and ones closed/settled in the last 3 days;
+    then, for open markets in watchlisted series only, recent hourly candles, 1-minute
+    candles (minute_candles) and new trades (trades)."""
     with db.run_log(c, "sync") as stats:
-        with _stage("sync", "reference"):
-            sync_reference(k, c)
+        with _stage("sync", "series"):
+            for page, _ in k.series():
+                stats["rows"] += db.upsert_series(c, page)
+            c.commit()
 
         recent = _epoch(_now() - timedelta(days=3))
         with _stage("sync", "open events"):
@@ -155,45 +190,23 @@ def sync(k: KalshiClient, c) -> None:
         with _stage("sync", "settled events (3d)"):
             stats["rows"] += _sync_events(k, c, status="settled", min_settled_ts=recent)
 
-        # hourly candles, last 3 hours (overlap is fine: upsert), for open markets that are
-        # either in a watchlisted series or traded and closing within 14 days; no multivariate.
-        hourly_where = """status IN ('active','initialized','inactive')
-            AND ticker NOT LIKE %s
-            AND (series_ticker IN (SELECT series_ticker FROM watchlist)
-                 OR (volume > 0 AND close_time <= now() + interval '14 days'))"""
-        with _stage("sync", "hourly candles"):
-            tickers = [m["ticker"] for m in _market_rows(c, hourly_where, ("KXMVE%",))]
-            end = _now()
-            start_ts, end_ts = _epoch(end - timedelta(hours=3)), _epoch(end)
-            size = k.BATCH_CANDLE_TICKERS
-            for i in range(0, len(tickers), size):
-                chunk = tickers[i:i + size]
-                try:
-                    by_ticker = k.candlesticks_batch(chunk, start_ts, end_ts, HOUR)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("hourly candles batch failed (%s..%s): %s", chunk[0], chunk[-1], e)
-                    continue
-                for t, candles in by_ticker.items():
-                    if candles:
-                        stats["rows"] += db.insert_candles(c, t, HOUR, candles)
-                c.commit()
-            log.info("sync: hourly candles for %d markets in %d batch calls", len(tickers), -(-len(tickers) // size))
-
-        # watchlist extras
-        with _stage("sync", "watchlist extras"):
-            for w in db.watchlist(c):
-                if w["minute_candles"]:
-                    for m in _market_rows(c, "series_ticker=%s AND status IN ('active','initialized','inactive')", (w["series_ticker"],)):
-                        stats["rows"] += load_candles(k, c, m, MINUTE, False, since=_now() - timedelta(hours=2))
-                if w["trades"]:
-                    for m in _market_rows(c, "series_ticker=%s AND status IN ('active','initialized','inactive','closed')", (w["series_ticker"],)):
-                        job = f"trades:{m['ticker']}"
-                        st = db.get_state(c, job)
-                        min_ts = _epoch(st["watermark"]) if st["watermark"] else None
-                        for page, nxt in k.trades(ticker=m["ticker"], min_ts=min_ts):
-                            stats["rows"] += db.insert_trades(c, page)
-                        db.set_state(c, job, watermark=_now() - timedelta(minutes=10))
-                c.commit()
+        watch = db.watchlist(c)
+        now = _now()
+        with _stage("sync", "hourly candles (3h)"):
+            tickers = [m["ticker"] for m in _open_markets(c, [w["series_ticker"] for w in watch])]
+            stats["rows"] += _batch_candles(k, c, tickers, HOUR, _epoch(now - timedelta(hours=3)), _epoch(now))
+        with _stage("sync", "minute candles (2h)"):
+            tickers = [m["ticker"] for m in _open_markets(c, [w["series_ticker"] for w in watch if w["minute_candles"]])]
+            stats["rows"] += _batch_candles(k, c, tickers, MINUTE, _epoch(now - timedelta(hours=2)), _epoch(now))
+        with _stage("sync", "trades"):
+            for m in _open_markets(c, [w["series_ticker"] for w in watch if w["trades"]]):
+                job = f"trades:{m['ticker']}"
+                st = db.get_state(c, job)
+                min_ts = _epoch(st["watermark"]) if st["watermark"] else None
+                for page, _ in k.trades(ticker=m["ticker"], min_ts=min_ts):
+                    stats["rows"] += db.insert_trades(c, page)
+                db.set_state(c, job, watermark=now - timedelta(minutes=10))
+            c.commit()
 
 
 # --------------------------------------------------------------------------- snapshot
@@ -215,18 +228,31 @@ def snapshot(k: KalshiClient, c, interval_min: int = 5) -> None:
 
 
 # --------------------------------------------------------------------------- reconcile
+def _life_windows(rows: list[dict], period: int) -> dict[tuple[int, int], list[str]]:
+    """Group markets by their (open_time, settled_time) window, snapped outward to period
+    boundaries so markets in the same event share one batch call."""
+    span = period * 60
+    groups: dict[tuple[int, int], list[str]] = {}
+    for m in rows:
+        start = m["open_time"] or (m["close_time"] - timedelta(days=90))
+        end = min(m["settled_time"], _now())
+        key = (_epoch(start) // span * span, -(-_epoch(end) // span) * span)
+        groups.setdefault(key, []).append(m["ticker"])
+    return groups
+
+
 def reconcile(k: KalshiClient, c) -> None:
-    """Nightly: lock in results for anything settled in the last 3 days and finish its
-    daily + hourly candles through settlement."""
+    """Nightly: lock in results for anything settled in the last 3 days, then daily candles
+    over each such market's full life; hourly too for markets in watchlisted series."""
     with db.run_log(c, "reconcile") as stats:
         since = _now() - timedelta(days=3)
-        for page, _ in k.markets(status="settled", min_settled_ts=_epoch(since)):
-            stats["rows"] += db.upsert_markets(c, page)
-        c.commit()
-        for m in _market_rows(c, "settled_time >= %s", (since,)):
-            for period in (DAY, HOUR):
-                try:
-                    stats["rows"] += load_candles(k, c, m, period, False)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("reconcile candles failed for %s/%d: %s", m["ticker"], period, e)
-        c.commit()
+        with _stage("reconcile", "settled events (3d)"):
+            stats["rows"] += _sync_events(k, c, status="settled", min_settled_ts=_epoch(since))
+
+        rows = _market_rows(c, "settled_time >= %s AND ticker NOT LIKE %s", (since, "KXMVE%"))
+        watched = {w["series_ticker"] for w in db.watchlist(c)}
+        hourly = [m for m in rows if m["series_ticker"] in watched]
+        for name, period, subset in (("daily", DAY, rows), ("hourly", HOUR, hourly)):
+            with _stage("reconcile", f"{name} candles ({len(subset)} markets)"):
+                for (s, e), tickers in _life_windows(subset, period).items():
+                    stats["rows"] += _batch_candles(k, c, tickers, period, s, e)
