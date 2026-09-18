@@ -106,6 +106,23 @@ class KalshiClient:
         data = self.get(path, {"start_ts": start_ts, "end_ts": end_ts, "period_interval": period})
         return data.get("candlesticks") or []
 
+    BATCH_CANDLE_TICKERS = 100  # GET /markets/candlesticks cap; also 10k candles per response
+
+    def candlesticks_batch(self, tickers: list[str], start_ts: int, end_ts: int, period: int) -> dict[str, list[dict]]:
+        """Live-tier batch candles for many markets at once. Chunks at 100 tickers per call
+        and returns {ticker: [candles]} (tickers with no candles map to [])."""
+        out: dict[str, list[dict]] = {t: [] for t in tickers}
+        for i in range(0, len(tickers), self.BATCH_CANDLE_TICKERS):
+            chunk = tickers[i:i + self.BATCH_CANDLE_TICKERS]
+            data = self.get("/markets/candlesticks", {
+                "market_tickers": ",".join(chunk), "start_ts": start_ts, "end_ts": end_ts,
+                "period_interval": period})
+            for mk in data.get("markets") or []:
+                t = mk.get("market_ticker") or mk.get("ticker")
+                if t:
+                    out.setdefault(t, []).extend(mk.get("candlesticks") or [])
+        return out
+
     def trades(self, cursor: str | None = None, historical: bool = False, **params):
         path = "/historical/trades" if historical else "/markets/trades"
         return self.paginate(path, "trades", params, cursor=cursor)

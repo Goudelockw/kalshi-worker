@@ -162,12 +162,22 @@ def sync(k: KalshiClient, c) -> None:
             AND (series_ticker IN (SELECT series_ticker FROM watchlist)
                  OR (volume > 0 AND close_time <= now() + interval '14 days'))"""
         with _stage("sync", "hourly candles"):
-            for m in _market_rows(c, hourly_where, ("KXMVE%",)):
+            tickers = [m["ticker"] for m in _market_rows(c, hourly_where, ("KXMVE%",))]
+            end = _now()
+            start_ts, end_ts = _epoch(end - timedelta(hours=3)), _epoch(end)
+            size = k.BATCH_CANDLE_TICKERS
+            for i in range(0, len(tickers), size):
+                chunk = tickers[i:i + size]
                 try:
-                    stats["rows"] += load_candles(k, c, m, HOUR, False, since=_now() - timedelta(hours=3))
+                    by_ticker = k.candlesticks_batch(chunk, start_ts, end_ts, HOUR)
                 except Exception as e:  # noqa: BLE001
-                    log.warning("hourly candles failed for %s: %s", m["ticker"], e)
-            c.commit()
+                    log.warning("hourly candles batch failed (%s..%s): %s", chunk[0], chunk[-1], e)
+                    continue
+                for t, candles in by_ticker.items():
+                    if candles:
+                        stats["rows"] += db.insert_candles(c, t, HOUR, candles)
+                c.commit()
+            log.info("sync: hourly candles for %d markets in %d batch calls", len(tickers), -(-len(tickers) // size))
 
         # watchlist extras
         with _stage("sync", "watchlist extras"):
