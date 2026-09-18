@@ -182,13 +182,19 @@ def sync(k: KalshiClient, c) -> None:
                 stats["rows"] += db.upsert_series(c, page)
             c.commit()
 
-        recent = _epoch(_now() - timedelta(days=3))
+        # closed/settled events are polled by update time: from the last run's watermark
+        # (10 min overlap) or 3 days back on the first run; the watermark advances afterwards.
+        started = _now()
+        st = db.get_state(c, "events_updated")
+        since = (st["watermark"] - timedelta(minutes=10)) if st["watermark"] else started - timedelta(days=3)
         with _stage("sync", "open events"):
             stats["rows"] += _sync_events(k, c, status="open")
-        with _stage("sync", "closed events (3d)"):
-            stats["rows"] += _sync_events(k, c, status="closed", min_close_ts=recent)
-        with _stage("sync", "settled events (3d)"):
-            stats["rows"] += _sync_events(k, c, status="settled", min_settled_ts=recent)
+        with _stage("sync", "closed events (updated)"):
+            stats["rows"] += _sync_events(k, c, status="closed", min_updated_ts=_epoch(since))
+        with _stage("sync", "settled events (updated)"):
+            stats["rows"] += _sync_events(k, c, status="settled", min_updated_ts=_epoch(since))
+        db.set_state(c, "events_updated", watermark=started)
+        c.commit()
 
         watch = db.watchlist(c)
         now = _now()
@@ -246,8 +252,8 @@ def reconcile(k: KalshiClient, c) -> None:
     over each such market's full life; hourly too for markets in watchlisted series."""
     with db.run_log(c, "reconcile") as stats:
         since = _now() - timedelta(days=3)
-        with _stage("reconcile", "settled events (3d)"):
-            stats["rows"] += _sync_events(k, c, status="settled", min_settled_ts=_epoch(since))
+        with _stage("reconcile", "settled events (updated 3d)"):
+            stats["rows"] += _sync_events(k, c, status="settled", min_updated_ts=_epoch(since))
 
         rows = _market_rows(c, "settled_time >= %s AND ticker NOT LIKE %s", (since, "KXMVE%"))
         watched = {w["series_ticker"] for w in db.watchlist(c)}
