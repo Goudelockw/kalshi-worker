@@ -106,7 +106,8 @@ class KalshiClient:
         data = self.get(path, {"start_ts": start_ts, "end_ts": end_ts, "period_interval": period})
         return data.get("candlesticks") or []
 
-    BATCH_CANDLE_TICKERS = 100  # GET /markets/candlesticks cap; also 10k candles per response
+    BATCH_CANDLE_TICKERS = 100  # GET /markets/candlesticks: max tickers per call
+    BATCH_CANDLES = 10_000      # ...and max candles per response
 
     def candlesticks_batch(self, tickers: list[str], start_ts: int, end_ts: int, period: int) -> dict[str, list[dict]]:
         """Live-tier batch candles for many markets at once. Chunks at 100 tickers per call
