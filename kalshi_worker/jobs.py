@@ -29,19 +29,6 @@ def _stage(job: str, name: str):
     log.info("%s: %s done in %.1fs", job, name, time.monotonic() - t0)
 
 
-# --------------------------------------------------------------------------- reference
-def sync_reference(k: KalshiClient, c) -> int:
-    """Series + events. Small; safe to do fully every run."""
-    n = 0
-    for page, _ in k.series():
-        n += db.upsert_series(c, page)
-    c.commit()
-    for page, _ in k.events(with_nested_markets=False):
-        n += db.upsert_events(c, page)
-    c.commit()
-    return n
-
-
 # ---------------------------------------------------------------------------- candles
 def _candle_windows(m: dict, period: int, since: datetime | None) -> tuple[int, int]:
     start = since or m["open_time"] or (m["close_time"] - timedelta(days=90))
@@ -72,52 +59,90 @@ def _market_rows(c, where: str, params: tuple = ()) -> list[dict]:
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-# --------------------------------------------------------------------------- backfill
-def backfill(k: KalshiClient, c, with_candles: bool = True) -> None:
-    """One-time: every settled market from the historical tier, then daily candles for each.
-    Resumable: cursor lives in sync_state('backfill_markets'); per-ticker candle progress in
-    sync_state('backfill_candles').meta['done_through'] (ticker ordering)."""
-    with db.run_log(c, "backfill") as stats:
-        sync_reference(k, c)
-
-        st = db.get_state(c, "backfill_markets")
-        if st["meta"].get("complete"):
-            log.info("historical markets already complete; skipping")
-        else:
-            cursor = st["cursor"]
-            for page, nxt in k.historical_markets(cursor=cursor):
-                stats["rows"] += db.upsert_markets(c, page)
-                db.set_state(c, "backfill_markets", cursor=nxt)
-                c.commit()
-                log.info("historical markets: +%d (total %d)", len(page), stats["rows"])
-            # live tier settled markets too (recent 3 months)
-            for page, _ in k.markets(status="settled"):
-                stats["rows"] += db.upsert_markets(c, page)
-                c.commit()
-            db.set_state(c, "backfill_markets", cursor=None, meta={"complete": True})
+def _batch_candles(k: KalshiClient, c, tickers: list[str], period: int, start_ts: int, end_ts: int) -> int:
+    """Candles for tickers sharing one window via the batch endpoint. Calls are sized so none
+    asks for more than BATCH_CANDLES candles: fewer tickers per call for long windows, and
+    time-sliced when a single ticker overflows. Failed calls are logged and skipped."""
+    if not tickers or start_ts >= end_ts:
+        return 0
+    per_ticker = (end_ts - start_ts) // (period * 60) + 1
+    size = max(1, min(k.BATCH_CANDLE_TICKERS, k.BATCH_CANDLES // per_ticker))
+    step = period * 60 * (k.BATCH_CANDLES // size - 1)  # inclusive range: N periods -> N+1 candles
+    n = 0
+    for i in range(0, len(tickers), size):
+        chunk = tickers[i:i + size]
+        for s in range(start_ts, end_ts, step):
+            try:
+                by_ticker = k.candlesticks_batch(chunk, s, min(s + step, end_ts), period)
+            except Exception as e:  # noqa: BLE001
+                log.warning("candles batch failed (%s..%s, period %d): %s", chunk[0], chunk[-1], period, e)
+                continue
+            for t, candles in by_ticker.items():
+                if candles:
+                    n += db.insert_candles(c, t, period, candles)
             c.commit()
+    return n
 
-        if not with_candles:
-            return
+
+def _life_windows(rows: list[dict], period: int) -> dict[tuple[int, int], list[str]]:
+    """Group markets by their (open_time, settled_time) window, snapped outward to period
+    boundaries so markets in the same event share one batch call."""
+    span = period * 60
+    groups: dict[tuple[int, int], list[str]] = {}
+    for m in rows:
+        start = m["open_time"] or (m["close_time"] - timedelta(days=90))
+        end = min(m["settled_time"] or m["close_time"], _now())
+        key = (_epoch(start) // span * span, -(-_epoch(end) // span) * span)
+        groups.setdefault(key, []).append(m["ticker"])
+    return groups
+
+
+# --------------------------------------------------------------------------- backfill
+def backfill(k: KalshiClient, c) -> None:
+    """One-time: daily candles for every settled market that has none yet, newest first.
+    Markets settled after the /historical/cutoff go through the batch endpoint (grouped by
+    life window, up to BATCH_CANDLE_TICKERS per call); older ones go one at a time through
+    /historical/markets/{ticker}/candlesticks, last. Resumable: the candle-less query skips
+    whatever already landed; sync_state('backfill_candles').meta tracks progress."""
+    with db.run_log(c, "backfill") as stats:
+        rows = _market_rows(c, """result <> '' AND ticker NOT LIKE %s
+            AND NOT EXISTS (SELECT 1 FROM candles WHERE candles.ticker = markets.ticker AND period_minutes = %s)
+            ORDER BY settled_time DESC NULLS LAST""", ("KXMVE%", DAY))
         cutoff = k.cutoff()
         cutoff_ts = db._ts(cutoff.get("market_settled_ts") or cutoff.get("settled_ts"))
-        st = db.get_state(c, "backfill_candles")
-        done_through = st["meta"].get("done_through", "")
-        rows = _market_rows(c, "result <> '' AND ticker > %s AND ticker NOT LIKE %s ORDER BY ticker",
-                            (done_through, "KXMVE%"))
-        log.info("backfilling daily candles for %d settled markets", len(rows))
-        for i, m in enumerate(rows, 1):
-            historical = bool(cutoff_ts and m["settled_time"] and m["settled_time"] < cutoff_ts)
-            try:
-                stats["rows"] += load_candles(k, c, m, DAY, historical)
-            except Exception as e:  # noqa: BLE001
-                log.warning("candles failed for %s: %s", m["ticker"], e)
-            if i % 50 == 0:
-                db.set_state(c, "backfill_candles", meta={"done_through": m["ticker"]})
-                c.commit()
-                log.info("candles %d/%d", i, len(rows))
-        db.set_state(c, "backfill_candles", meta={"done_through": "~", "complete": True})
-        c.commit()
+
+        def old(m: dict) -> bool:
+            end = m["settled_time"] or m["close_time"]
+            return bool(cutoff_ts and end and end < cutoff_ts)
+
+        recent = [m for m in rows if not old(m)]
+        historical = [m for m in rows if old(m)]
+        total, done = len(rows), 0
+        log.info("backfill: %d settled markets without daily candles (%d batch, %d historical)",
+                 total, len(recent), len(historical))
+
+        def checkpoint(final: bool = False) -> None:
+            db.set_state(c, "backfill_candles", meta={"done": done, "total": total, "complete": final})
+            c.commit()
+            log.info("backfill: %d/%d markets, %d candles", done, total, stats["rows"])
+
+        with _stage("backfill", f"batch daily candles ({len(recent)} markets)"):
+            for (s, e), tickers in _life_windows(recent, DAY).items():
+                stats["rows"] += _batch_candles(k, c, tickers, DAY, s, e)
+                prev, done = done, done + len(tickers)
+                if prev // 50 != done // 50:
+                    checkpoint()
+
+        with _stage("backfill", f"historical daily candles ({len(historical)} markets)"):
+            for m in historical:
+                try:
+                    stats["rows"] += load_candles(k, c, m, DAY, historical=True)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("historical candles failed for %s: %s", m["ticker"], e)
+                done += 1
+                if done % 50 == 0:
+                    checkpoint()
+        checkpoint(final=True)
 
 
 # ------------------------------------------------------------------------------- sync
@@ -145,31 +170,6 @@ def _sync_events(k: KalshiClient, c, **params) -> int:
 
 def _open_markets(c, series: list[str]) -> list[dict]:
     return _market_rows(c, f"series_ticker = ANY(%s) AND {OPEN}", (series,))
-
-
-def _batch_candles(k: KalshiClient, c, tickers: list[str], period: int, start_ts: int, end_ts: int) -> int:
-    """Candles for tickers sharing one window via the batch endpoint. Calls are sized so none
-    asks for more than BATCH_CANDLES candles: fewer tickers per call for long windows, and
-    time-sliced when a single ticker overflows. Failed calls are logged and skipped."""
-    if not tickers or start_ts >= end_ts:
-        return 0
-    per_ticker = (end_ts - start_ts) // (period * 60) + 1
-    size = max(1, min(k.BATCH_CANDLE_TICKERS, k.BATCH_CANDLES // per_ticker))
-    step = period * 60 * (k.BATCH_CANDLES // size - 1)  # inclusive range: N periods -> N+1 candles
-    n = 0
-    for i in range(0, len(tickers), size):
-        chunk = tickers[i:i + size]
-        for s in range(start_ts, end_ts, step):
-            try:
-                by_ticker = k.candlesticks_batch(chunk, s, min(s + step, end_ts), period)
-            except Exception as e:  # noqa: BLE001
-                log.warning("candles batch failed (%s..%s, period %d): %s", chunk[0], chunk[-1], period, e)
-                continue
-            for t, candles in by_ticker.items():
-                if candles:
-                    n += db.insert_candles(c, t, period, candles)
-            c.commit()
-    return n
 
 
 def sync(k: KalshiClient, c) -> None:
@@ -234,19 +234,6 @@ def snapshot(k: KalshiClient, c, interval_min: int = 5) -> None:
 
 
 # --------------------------------------------------------------------------- reconcile
-def _life_windows(rows: list[dict], period: int) -> dict[tuple[int, int], list[str]]:
-    """Group markets by their (open_time, settled_time) window, snapped outward to period
-    boundaries so markets in the same event share one batch call."""
-    span = period * 60
-    groups: dict[tuple[int, int], list[str]] = {}
-    for m in rows:
-        start = m["open_time"] or (m["close_time"] - timedelta(days=90))
-        end = min(m["settled_time"], _now())
-        key = (_epoch(start) // span * span, -(-_epoch(end) // span) * span)
-        groups.setdefault(key, []).append(m["ticker"])
-    return groups
-
-
 def reconcile(k: KalshiClient, c) -> None:
     """Nightly: lock in results for anything settled in the last 3 days, then daily candles
     over each such market's full life; hourly too for markets in watchlisted series."""

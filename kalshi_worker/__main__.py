@@ -1,6 +1,6 @@
 """CLI entry point.
 
-  python -m kalshi_worker backfill     one-time historical load (resumable)
+  python -m kalshi_worker backfill     one-time daily-candle backfill (resumable)
   python -m kalshi_worker sync         hourly refresh          (Railway cron)
   python -m kalshi_worker reconcile    nightly settlement lock (Railway cron)
   python -m kalshi_worker snapshot     one order-book snapshot pass
@@ -24,7 +24,7 @@ def run(cmd: str) -> None:
     k = KalshiClient()
     with db.conn() as c:
         if cmd == "backfill":
-            jobs.backfill(k, c, with_candles=os.getenv("BACKFILL_CANDLES", "1") == "1")
+            jobs.backfill(k, c)
         elif cmd == "sync":
             jobs.sync(k, c)
         elif cmd == "reconcile":
