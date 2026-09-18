@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from . import db
@@ -19,6 +20,13 @@ def _now() -> datetime:
 
 def _epoch(dt: datetime) -> int:
     return int(dt.timestamp())
+
+
+@contextmanager
+def _stage(job: str, name: str):
+    t0 = time.monotonic()
+    yield
+    log.info("%s: %s done in %.1fs", job, name, time.monotonic() - t0)
 
 
 # --------------------------------------------------------------------------- reference
@@ -113,23 +121,39 @@ def backfill(k: KalshiClient, c, with_candles: bool = True) -> None:
 
 
 # ------------------------------------------------------------------------------- sync
-def sync(k: KalshiClient, c) -> None:
-    """Hourly: refresh open markets, newly created/closed ones, hourly candles for open
-    markets, and trades for watchlisted series."""
-    with db.run_log(c, "sync") as stats:
-        sync_reference(k, c)
-        for status in ("open", "unopened", "closed"):
-            for page, _ in k.markets(status=status):
-                stats["rows"] += db.upsert_markets(c, page)
-                c.commit()
-        # markets settled since last sync
-        st = db.get_state(c, "sync_settled")
-        since = st["watermark"] or (_now() - timedelta(days=2))
-        for page, _ in k.markets(status="settled", min_settled_ts=_epoch(since)):
-            stats["rows"] += db.upsert_markets(c, page)
-            c.commit()
-        db.set_state(c, "sync_settled", watermark=_now() - timedelta(hours=1))
+def _sync_events(k: KalshiClient, c, **params) -> int:
+    """Page /events with nested markets; upsert each event row, then its markets with
+    series_ticker/event_ticker taken from the parent. Returns rows written."""
+    n = 0
+    for page, _ in k.events(with_nested_markets="true", **params):
+        events, markets = [], []
+        for ev in page:
+            nested = ev.pop("markets", None) or []
+            for m in nested:
+                m["event_ticker"] = ev["event_ticker"]
+                m["series_ticker"] = ev.get("series_ticker")
+            events.append(ev)
+            markets.extend(nested)
+        n += db.upsert_events(c, events)
+        n += db.upsert_markets(c, markets)  # drops KXMVE* tickers
         c.commit()
+    return n
+
+
+def sync(k: KalshiClient, c) -> None:
+    """Hourly: refresh open events/markets, ones closed or settled in the last 3 days,
+    hourly candles for in-scope open markets, and trades for watchlisted series."""
+    with db.run_log(c, "sync") as stats:
+        with _stage("sync", "reference"):
+            sync_reference(k, c)
+
+        recent = _epoch(_now() - timedelta(days=3))
+        with _stage("sync", "open events"):
+            stats["rows"] += _sync_events(k, c, status="open")
+        with _stage("sync", "closed events (3d)"):
+            stats["rows"] += _sync_events(k, c, status="closed", min_close_ts=recent)
+        with _stage("sync", "settled events (3d)"):
+            stats["rows"] += _sync_events(k, c, status="settled", min_settled_ts=recent)
 
         # hourly candles, last 3 hours (overlap is fine: upsert), for open markets that are
         # either in a watchlisted series or traded and closing within 14 days; no multivariate.
@@ -137,27 +161,29 @@ def sync(k: KalshiClient, c) -> None:
             AND ticker NOT LIKE %s
             AND (series_ticker IN (SELECT series_ticker FROM watchlist)
                  OR (volume > 0 AND close_time <= now() + interval '14 days'))"""
-        for m in _market_rows(c, hourly_where, ("KXMVE%",)):
-            try:
-                stats["rows"] += load_candles(k, c, m, HOUR, False, since=_now() - timedelta(hours=3))
-            except Exception as e:  # noqa: BLE001
-                log.warning("hourly candles failed for %s: %s", m["ticker"], e)
-        c.commit()
+        with _stage("sync", "hourly candles"):
+            for m in _market_rows(c, hourly_where, ("KXMVE%",)):
+                try:
+                    stats["rows"] += load_candles(k, c, m, HOUR, False, since=_now() - timedelta(hours=3))
+                except Exception as e:  # noqa: BLE001
+                    log.warning("hourly candles failed for %s: %s", m["ticker"], e)
+            c.commit()
 
         # watchlist extras
-        for w in db.watchlist(c):
-            if w["minute_candles"]:
-                for m in _market_rows(c, "series_ticker=%s AND status IN ('active','initialized','inactive')", (w["series_ticker"],)):
-                    stats["rows"] += load_candles(k, c, m, MINUTE, False, since=_now() - timedelta(hours=2))
-            if w["trades"]:
-                for m in _market_rows(c, "series_ticker=%s AND status IN ('active','initialized','inactive','closed')", (w["series_ticker"],)):
-                    job = f"trades:{m['ticker']}"
-                    st = db.get_state(c, job)
-                    min_ts = _epoch(st["watermark"]) if st["watermark"] else None
-                    for page, nxt in k.trades(ticker=m["ticker"], min_ts=min_ts):
-                        stats["rows"] += db.insert_trades(c, page)
-                    db.set_state(c, job, watermark=_now() - timedelta(minutes=10))
-            c.commit()
+        with _stage("sync", "watchlist extras"):
+            for w in db.watchlist(c):
+                if w["minute_candles"]:
+                    for m in _market_rows(c, "series_ticker=%s AND status IN ('active','initialized','inactive')", (w["series_ticker"],)):
+                        stats["rows"] += load_candles(k, c, m, MINUTE, False, since=_now() - timedelta(hours=2))
+                if w["trades"]:
+                    for m in _market_rows(c, "series_ticker=%s AND status IN ('active','initialized','inactive','closed')", (w["series_ticker"],)):
+                        job = f"trades:{m['ticker']}"
+                        st = db.get_state(c, job)
+                        min_ts = _epoch(st["watermark"]) if st["watermark"] else None
+                        for page, nxt in k.trades(ticker=m["ticker"], min_ts=min_ts):
+                            stats["rows"] += db.insert_trades(c, page)
+                        db.set_state(c, job, watermark=_now() - timedelta(minutes=10))
+                c.commit()
 
 
 # --------------------------------------------------------------------------- snapshot
