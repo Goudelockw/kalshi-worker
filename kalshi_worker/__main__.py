@@ -4,7 +4,8 @@
   python -m kalshi_worker sync         hourly refresh          (Railway cron)
   python -m kalshi_worker reconcile    nightly settlement lock (Railway cron)
   python -m kalshi_worker snapshot     one order-book snapshot pass
-  python -m kalshi_worker transcripts [--limit N]   parse pending Motley Fool transcripts
+  python -m kalshi_worker transcripts [--limit N] [--reparse]   parse pending Motley Fool
+                                       transcripts; --reparse re-parses stored HTML instead
   python -m kalshi_worker worker       always-on: snapshot every N minutes
 """
 import logging
@@ -43,7 +44,10 @@ def run(cmd: str, args: list[str] = ()) -> None:
         elif cmd == "snapshot":
             jobs.snapshot(k, c, int(os.getenv("SNAPSHOT_INTERVAL_MIN", "5")))
         elif cmd == "transcripts":
-            transcripts.run(c, limit=_opt("limit", list(args)))
+            if "--reparse" in args:
+                transcripts.reparse(c, limit=_opt("limit", list(args)))
+            else:
+                transcripts.run(c, limit=_opt("limit", list(args)))
         else:
             raise SystemExit(f"unknown command {cmd!r}")
 
