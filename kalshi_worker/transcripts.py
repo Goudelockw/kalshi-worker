@@ -161,7 +161,8 @@ def parse_transcript(page: str) -> dict:
 
 def _parse_current(sections: dict[str, str]) -> tuple[list[dict], list[str]]:
     """Current template. Only the HTML after the "Full Conference Call Transcript" <h2> is read
-    for turns. Roles: Operator by name; speakers listed under "CALL PARTICIPANTS" are exec (or
+    for turns. A turn starts at <p><strong>Name:</strong> text</p> and continues through every
+    following plain <p> until the next <p><strong> line or the end of the article. Roles: Operator by name; speakers listed under "CALL PARTICIPANTS" are exec (or
     analyst when the title says so); unlisted speakers are analyst when all their turns are in
     Q&A, else unknown."""
     body = _section(sections, TRANSCRIPT_H2)
@@ -169,6 +170,7 @@ def _parse_current(sections: dict[str, str]) -> tuple[list[dict], list[str]]:
 
     turns: list[dict] = []
     paragraphs: list[str] = []
+    cur: dict | None = None            # the turn that following plain <p>s belong to
     for m in P_RE.finditer(body):
         raw = m.group(0)
         turn = TURN_RE.fullmatch(raw) if raw.startswith("<p>") else None
@@ -176,13 +178,24 @@ def _parse_current(sections: dict[str, str]) -> tuple[list[dict], list[str]]:
             name, text = html.unescape(turn.group(1)).strip(), _text(turn.group(2))
             if name.lower() in NOT_SPEAKERS:
                 paragraphs.append(f"{name}: {text}")
-            elif text:
-                turns.append({"speaker": name, "text": text})
-                paragraphs.append(f"{name}: {text}")
+                cur = None
+            else:
+                cur = {"speaker": name, "text": text}
+                turns.append(cur)
+                if text:
+                    paragraphs.append(f"{name}: {text}")
             continue
+        if re.match(r"<p[^>]*>\s*<strong>", raw, re.I):   # bold-led line that isn't a turn: ends the turn
+            cur = None
         text = _text(m.group(1))
-        if text and not _is_boilerplate(text):
+        if not text or _is_boilerplate(text):
+            continue
+        if cur is not None:                                # continuation paragraph of the open turn
+            paragraphs.append(text if cur["text"] else f"{cur['speaker']}: {text}")
+            cur["text"] = f"{cur['text']} {text}".strip()
+        else:
             paragraphs.append(text)
+    turns = [t for t in turns if t["text"]]
 
     # sections: prepared until the first Operator turn mentioning "question" after remarks began
     section, seen_remarks = "prepared", False
@@ -250,8 +263,8 @@ def _parse_legacy(sections: dict[str, str]) -> tuple[list[dict], list[str]]:
             if cur is None:
                 paragraphs.append(text)
                 continue
+            paragraphs.append(text if cur["text"] else f"{cur['speaker']}: {text}")
             cur["text"] = f"{cur['text']} {text}".strip()
-            paragraphs.append(f"{cur['speaker']}: {text}")
     turns = [t for t in turns if t["text"]]
     return turns, paragraphs
 
@@ -285,16 +298,39 @@ def _write(c, src: dict, year: int, quarter: int, html: str, parsed: dict) -> in
             (src["symbol"], year, quarter, src["call_date"], src["source"], src["url"],
              html, raw_text, len(raw_text.split())))
         tid = cur.fetchone()[0]
-        cur.execute("DELETE FROM transcript_segments WHERE transcript_id = %s", (tid,))
-        cur.executemany("""
-            INSERT INTO transcript_segments (transcript_id, seq, speaker, speaker_title, role, section, text, word_count)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-            [(tid, i, t["speaker"], t["speaker_title"], t["role"], t["section"], t["text"], len(t["text"].split()))
-             for i, t in enumerate(parsed["turns"], 1)])
+        _write_segments(cur, tid, parsed["turns"])
         cur.execute("""UPDATE transcript_sources SET status='parsed', fetched_at=now(), error=NULL
                        WHERE url = %s""", (src["url"],))
     c.commit()
     return 1 + len(parsed["turns"])
+
+
+def _write_segments(cur, tid: int, turns: list[dict]) -> None:
+    cur.execute("DELETE FROM transcript_segments WHERE transcript_id = %s", (tid,))
+    cur.executemany("""
+        INSERT INTO transcript_segments (transcript_id, seq, speaker, speaker_title, role, section, text, word_count)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+        [(tid, i, t["speaker"], t["speaker_title"], t["role"], t["section"], t["text"], len(t["text"].split()))
+         for i, t in enumerate(turns, 1)])
+
+
+def _truncated(c, limit: int | None, ratio: float) -> list[dict]:
+    """Stored transcripts whose segments hold less than `ratio` of the transcript's word_count."""
+    sql = """SELECT t.id, t.symbol, t.fiscal_year, t.fiscal_quarter, t.raw_html,
+                    t.word_count, coalesce(sum(s.word_count), 0) AS segment_words
+             FROM transcripts t LEFT JOIN transcript_segments s ON s.transcript_id = t.id
+             WHERE t.raw_html IS NOT NULL
+             GROUP BY t.id
+             HAVING coalesce(sum(s.word_count), 0) < %s * coalesce(t.word_count, 0)
+             ORDER BY t.call_date DESC NULLS LAST, t.id"""
+    params: tuple = (ratio,)
+    if limit:
+        sql += " LIMIT %s"
+        params += (limit,)
+    with c.cursor() as cur:
+        cur.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
 def _fail(c, url: str, fetched: bool, err: str) -> None:
@@ -342,3 +378,40 @@ def run(c, limit: int | None = None) -> None:
                          i, len(queue), ok, failed, time.monotonic() - t0)
     http.close()
 
+
+
+
+REPARSE_RATIO = 0.7
+
+
+def reparse(c, limit: int | None = None) -> None:
+    """Re-run the parser on stored raw_html (no HTTP) for every transcript whose segments
+    hold less than REPARSE_RATIO of its word_count; rewrite raw_text and its segments."""
+    with db.run_log(c, "transcripts_reparse") as stats:
+        rows = _truncated(c, limit, REPARSE_RATIO)
+        log.info("transcripts: reparse %d transcripts with segments under %.0f%% of word_count%s",
+                 len(rows), REPARSE_RATIO * 100, f" (limit {limit})" if limit else "")
+        ok = failed = 0
+        for i, t in enumerate(rows, 1):
+            label = f"{t['symbol']} Q{t['fiscal_quarter']} {t['fiscal_year']} (id {t['id']})"
+            try:
+                parsed = parse_transcript(t["raw_html"])
+                if not parsed["turns"]:
+                    raise ValueError("no speaker turns found")
+                raw_text = parsed["raw_text"]
+                with c.cursor() as cur:
+                    cur.execute("UPDATE transcripts SET raw_text=%s, word_count=%s, parsed_at=now() WHERE id=%s",
+                                (raw_text, len(raw_text.split()), t["id"]))
+                    _write_segments(cur, t["id"], parsed["turns"])
+                c.commit()
+                stats["rows"] += 1 + len(parsed["turns"])
+                ok += 1
+                seg_words = sum(len(x["text"].split()) for x in parsed["turns"])
+                log.info("transcripts: reparsed %s (%s template): %d turns, segment words %s -> %d",
+                         label, parsed["template"], len(parsed["turns"]), t["segment_words"], seg_words)
+            except Exception as e:  # noqa: BLE001
+                c.rollback()
+                failed += 1
+                log.warning("transcripts: reparse failed for %s: %s", label, e)
+            if i % 25 == 0 or i == len(rows):
+                log.info("transcripts: reparse %d/%d done (%d ok, %d failed)", i, len(rows), ok, failed)
