@@ -22,6 +22,11 @@ log = logging.getLogger(__name__)
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 REQUEST_DELAY_S = 1.0
+SITEMAP_URL = "https://www.fool.com/sitemap/{year}/{month:02d}"
+DISCOVER_MONTHS = 2
+LOC_RE = re.compile(r"<loc>\s*(.*?)\s*</loc>", re.S | re.I)
+TRANSCRIPT_PATH_RE = re.compile(r"/earnings/call-transcripts/(\d{4})/(\d{2})/(\d{2})/")
+SLUG_RE = re.compile(r"-([a-z0-9.]+)-q([1-4])-(\d{4})-")
 
 TITLE_RE = re.compile(r"\bQ([1-4])\s+(?:FY\s*)?(\d{4})\b", re.I)
 SEPARATOR_RE = re.compile(r"\s+(?:--|—|–)\s+")
@@ -306,9 +311,85 @@ def _parse_legacy(sections: dict[str, str]) -> tuple[list[dict], list[str]]:
     return turns, paragraphs
 
 
+# ---------------------------------------------------------------------------- discover
+def _months(today: date, n: int) -> list[tuple[int, int]]:
+    """(year, month) for the current month and the n-1 before it, newest first."""
+    y, m, out = today.year, today.month, []
+    for _ in range(max(1, n)):
+        out.append((y, m))
+        y, m = (y, m - 1) if m > 1 else (y - 1, 12)
+    return out
+
+
+def _mention_symbols(c) -> dict[str, str]:
+    """{normalized symbol: Kalshi symbol} for every KXEARNINGSMENTION<symbol> series seen."""
+    with c.cursor() as cur:
+        cur.execute("""SELECT DISTINCT substring(series_ticker FROM '^KXEARNINGSMENTION(.+)$')
+                       FROM markets WHERE series_ticker LIKE 'KXEARNINGSMENTION%'""")
+        return {_norm(r[0]): r[0] for r in cur.fetchall() if r[0]}
+
+
+def _norm(symbol: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", symbol.upper())
+
+
+def parse_sitemap(xml: str, symbols: dict[str, str]) -> list[dict]:
+    """Transcript URLs in a Fool sitemap whose slug names a symbol in `symbols`."""
+    out, seen = [], set()
+    for m in LOC_RE.finditer(xml):
+        url = html.unescape(m.group(1)).strip()
+        pm = TRANSCRIPT_PATH_RE.search(url)
+        sm = SLUG_RE.search(url.rsplit("/", 2)[-2] if url.endswith("/") else url.rsplit("/", 1)[-1])
+        if not pm or not sm or url in seen:
+            continue
+        symbol = symbols.get(_norm(sm.group(1)))
+        if not symbol:
+            continue
+        seen.add(url)
+        try:
+            published = date(int(pm.group(1)), int(pm.group(2)), int(pm.group(3)))
+        except ValueError:
+            published = None
+        out.append({"url": url, "symbol": symbol, "fiscal_quarter": int(sm.group(2)),
+                    "fiscal_year": int(sm.group(3)), "published_date": published})
+    return out
+
+
+def discover(http: httpx.Client, c, months: int = DISCOVER_MONTHS) -> int:
+    """Queue transcript URLs for companies with earnings-mention markets from the Fool monthly
+    sitemaps (current month and the months-1 before it). Returns the number of new rows."""
+    symbols = _mention_symbols(c)
+    if not symbols:
+        log.info("transcripts: discover skipped, no KXEARNINGSMENTION series in markets")
+        return 0
+    found: list[dict] = []
+    for i, (y, m) in enumerate(_months(date.today(), months)):
+        if i:
+            time.sleep(REQUEST_DELAY_S)
+        url = SITEMAP_URL.format(year=y, month=m)
+        try:
+            found.extend(parse_sitemap(fetch(http, url), symbols))
+        except Exception as e:  # noqa: BLE001
+            log.warning("transcripts: sitemap %s failed: %s", url, e)
+    new = 0
+    with c.cursor() as cur:
+        for r in found:
+            cur.execute("""INSERT INTO transcript_sources (symbol, source, url, fiscal_year, fiscal_quarter,
+                                                           call_date, published_date)
+                           VALUES (%s, 'fool', %s, %s, %s, %s, %s) ON CONFLICT (url) DO NOTHING""",
+                        (r["symbol"], r["url"], r["fiscal_year"], r["fiscal_quarter"], r["published_date"],
+                         r["published_date"]))
+            new += cur.rowcount
+    c.commit()
+    log.info("transcripts: discover queued %d new URLs (%d matched %d tracked symbols across %d sitemaps)",
+             new, len(found), len(symbols), months)
+    return new
+
+
 # --------------------------------------------------------------------------------- db
 def _pending(c, limit: int | None) -> list[dict]:
-    sql = """SELECT url, symbol, source, fiscal_year, fiscal_quarter, call_date
+    sql = """SELECT url, symbol, source, fiscal_year, fiscal_quarter, call_date,
+                    coalesce(published_date, call_date) AS published_date
              FROM transcript_sources WHERE status = 'pending'
              ORDER BY call_date DESC NULLS LAST, url"""
     params: tuple = ()
@@ -333,7 +414,7 @@ def _write(c, src: dict, year: int, quarter: int, html: str, parsed: dict) -> in
               source_url=EXCLUDED.source_url, raw_html=EXCLUDED.raw_html,
               raw_text=EXCLUDED.raw_text, word_count=EXCLUDED.word_count, parsed_at=now()
             RETURNING id""",
-            (src["symbol"], year, quarter, parsed["call_date"] or src["call_date"], src["call_date"],
+            (src["symbol"], year, quarter, parsed["call_date"] or src["call_date"], src["published_date"],
              src["source"], src["url"], html, raw_text, len(raw_text.split())))
         tid = cur.fetchone()[0]
         _write_segments(cur, tid, parsed["turns"])
@@ -356,7 +437,7 @@ def _stale(c, limit: int | None, ratio: float) -> list[dict]:
     """Stored transcripts to re-parse: segments hold less than `ratio` of the transcript's
     word_count, or the page date was never parsed (published_date is null)."""
     sql = """SELECT t.id, t.symbol, t.fiscal_year, t.fiscal_quarter, t.raw_html, t.call_date,
-                    t.published_date, ts.call_date AS source_date,
+                    t.published_date, coalesce(ts.published_date, ts.call_date) AS source_date,
                     t.word_count, coalesce(sum(s.word_count), 0) AS segment_words
              FROM transcripts t
              LEFT JOIN transcript_sources ts ON ts.url = t.source_url
@@ -386,11 +467,16 @@ def _fail(c, url: str, fetched: bool, err: str) -> None:
 
 
 # -------------------------------------------------------------------------------- job
-def run(c, limit: int | None = None) -> None:
+def run(c, limit: int | None = None, discover_months: int = DISCOVER_MONTHS) -> None:
     http = httpx.Client(timeout=30.0, follow_redirects=True,
-                        headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml",
+                        headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,application/xml",
                                  "Accept-Language": "en-US,en;q=0.9"})
     with db.run_log(c, "transcripts") as stats:
+        try:
+            stats["rows"] += discover(http, c, discover_months)
+        except Exception as e:  # noqa: BLE001
+            c.rollback()
+            log.warning("transcripts: discover failed: %s", e)
         queue = _pending(c, limit)
         log.info("transcripts: %d pending%s", len(queue), f" (limit {limit})" if limit else "")
         ok = failed = 0
