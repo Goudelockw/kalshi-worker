@@ -24,6 +24,11 @@ REQUEST_DELAY_S = 1.0
 
 TITLE_RE = re.compile(r"\bQ([1-4])\s+(?:FY\s*)?(\d{4})\b", re.I)
 SEPARATOR_RE = re.compile(r"\s+(?:--|—|–)\s+")
+PART_SEP_RE = re.compile(r"\s+(?:--|—|–|-)\s+")           # participants lines also use ' - '
+ITEM_RE = re.compile(r"<(?:li|p)[^>]*>(.*?)</(?:li|p)>", re.S | re.I)
+ROLE_WORDS_RE = re.compile(r"\b(?:officer|president|chief|vice|director|head|analyst|relations|manager|"
+                           r"chair|chairman|founder|treasurer|secretary|counsel|partner|executive|"
+                           r"senior|managing|general|operating|financial|technology|strategy)\b", re.I)
 NOT_SPEAKERS = {"duration", "image source", "contents"}
 BOILERPLATE = (
     "this article is a transcript",
@@ -101,24 +106,23 @@ def _section(sections: dict[str, str], prefix: str) -> str | None:
 
 
 def _participants(section_html: str | None) -> dict[str, str | None]:
-    """'CALL PARTICIPANTS' lines -> {name: title}. Lines look like 'Name -- Title', with the
-    name possibly in <strong>; anything after the name (minus separators) is the title."""
+    """'CALL PARTICIPANTS' lines -> {name: title}. Current pages list '<li>Title - Name</li>';
+    older ones '<p><strong>Name</strong> -- Title</p>'. Whichever side looks like a job title
+    (role words, or more than four words) is the title; the other is the name."""
     out: dict[str, str | None] = {}
-    for m in P_RE.finditer(section_html or ""):
-        strong = re.search(r"<strong>(.*?)</strong>", m.group(1), re.S)
+    for m in ITEM_RE.finditer(section_html or ""):
         text = _text(m.group(1))
         if not text or len(text) > 160:
             continue
-        if strong is not None and _text(strong.group(1)):
-            name = _text(strong.group(1)).rstrip(":")
-            title = text[len(_text(strong.group(1))):] if text.startswith(_text(strong.group(1))) else text
-        else:
-            parts = SEPARATOR_RE.split(text, 1)
-            if len(parts) < 2 or len(parts[0].split()) > 5:
-                continue
-            name, title = parts[0], parts[1]
-        title = re.sub(r"^[\s:–—-]+", "", title).strip() or None
-        out.setdefault(name.strip(), title)
+        parts = [x.strip() for x in PART_SEP_RE.split(text) if x.strip()]
+        if len(parts) < 2:
+            out.setdefault(text, None)
+            continue
+        titleish = [bool(ROLE_WORDS_RE.search(x)) or len(x.split()) > 4 for x in parts]
+        name_idx = titleish.index(False) if False in titleish else len(parts) - 1
+        name = parts[name_idx].rstrip(":")
+        title = " -- ".join(x for i, x in enumerate(parts) if i != name_idx) or None
+        out.setdefault(name, title)
     return out
 
 
@@ -130,8 +134,9 @@ def _is_boilerplate(text: str) -> bool:
 def parse_transcript(page: str) -> dict:
     """Return {"title", "fiscal": (year, quarter) | None, "raw_text", "turns": [...]}, where each
     turn is {"speaker", "speaker_title", "role", "section", "text"} in page order. Only the
-    HTML after the "Full Conference Call Transcript" <h2> is read for turns; roles come from
-    the "CALL PARTICIPANTS" <h2> section."""
+    HTML after the "Full Conference Call Transcript" <h2> is read for turns. Roles: Operator by
+    name; speakers listed under "CALL PARTICIPANTS" are exec (or analyst when the title says
+    so); unlisted speakers are analyst when all their turns are in Q&A, else unknown."""
     tm = re.search(r"<title[^>]*>(.*?)</title>", page, re.S | re.I)
     title = _text(tm.group(1)) if tm else None
     sections = _sections(page)
@@ -167,18 +172,18 @@ def parse_transcript(page: str) -> dict:
             seen_remarks = True
         t["section"] = section
 
-    prepared_speakers = {t["speaker"] for t in turns if t["section"] == "prepared" and t["speaker"].lower() != "operator"}
+    in_prepared = {t["speaker"] for t in turns if t["section"] == "prepared"}
     for t in turns:
         name = t["speaker"]
         ttl = participants.get(name)
         t["speaker_title"] = ttl
         if name.lower() == "operator":
             t["role"] = "operator"
-        elif ttl and any(w in ttl.lower() for w in ANALYST_WORDS):
+        elif name in participants:
+            t["role"] = "analyst" if ttl and any(w in ttl.lower() for w in ANALYST_WORDS) else "exec"
+        elif name not in in_prepared:          # unlisted and only ever speaks in Q&A
             t["role"] = "analyst"
-        elif name in prepared_speakers or (name in participants and ttl):
-            t["role"] = "exec"
-        else:
+        else:                                  # spoke in prepared remarks but isn't listed
             t["role"] = "unknown"
 
     return {"title": title, "fiscal": parse_title(title), "raw_text": "\n\n".join(paragraphs), "turns": turns}
