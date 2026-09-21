@@ -11,6 +11,7 @@ import html
 import logging
 import re
 import time
+from datetime import date
 
 import httpx
 
@@ -85,6 +86,10 @@ LEGACY_SPEAKER_RE = re.compile(
     r"<p[^>]*>\s*<strong>([^<]+)</strong>\s*(?:(?:--|&mdash;|—|–)\s*<em>([^<]*)</em>)?\s*</p>", re.S | re.I)
 
 
+DATE_H2 = "date"
+# 'Thursday, Sept. 10, 2026 at 5 p.m. ET' / 'Mar 27, 2025' / 'September 11, 2026'
+DATE_RE = re.compile(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})\b", re.I)
+MONTHS = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
 BLOCK_TAG_RE = re.compile(r"</?(?:p|div|li|ul|ol|h\d|br|tr|td|th|table|blockquote)\b[^>]*>", re.I)
 
 
@@ -99,6 +104,36 @@ def parse_title(title: str | None) -> tuple[int, int] | None:
     """'Adobe (ADBE) Q3 2026 Earnings Call Transcript' -> (2026, 3)."""
     m = TITLE_RE.search(title or "")
     return (int(m.group(2)), int(m.group(1))) if m else None
+
+
+def parse_date(text: str | None) -> date | None:
+    """First 'Month D, YYYY' in the text (month may be abbreviated, with or without a period)."""
+    m = DATE_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        return date(int(m.group(3)), MONTHS[m.group(1).lower()], int(m.group(2)))
+    except ValueError:
+        return None
+
+
+def parse_call_date(page: str, sections: dict[str, str]) -> date | None:
+    """Actual call date from the page: the <h2>DATE</h2> section on current pages; on legacy
+    pages the <span id="date"> (or the first 'Earnings Call' paragraph) near the top."""
+    sec = _section(sections, DATE_H2)
+    if sec is not None:
+        pm = P_RE.search(sec)
+        d = parse_date(_text(pm.group(1) if pm else sec))
+        if d:
+            return d
+    sm = re.search(r'<span[^>]*id="date"[^>]*>(.*?)</span>', page, re.S | re.I)
+    if sm and (d := parse_date(_text(sm.group(1)))):
+        return d
+    for pm in P_RE.finditer(page):
+        text = _text(pm.group(1))
+        if "earnings call" in text.lower() and (d := parse_date(text)):
+            return d
+    return None
 
 
 def _sections(page: str) -> dict[str, str]:
@@ -142,7 +177,8 @@ def _is_boilerplate(text: str) -> bool:
 
 
 def parse_transcript(page: str) -> dict:
-    """Return {"title", "fiscal": (year, quarter) | None, "template", "raw_text", "turns": [...]},
+    """Return {"title", "fiscal": (year, quarter) | None, "template", "call_date", "raw_text",
+    "turns": [...]},
     where each turn is {"speaker", "speaker_title", "role", "section", "text"} in page order.
     Two Fool templates: the current one (a "Full Conference Call Transcript" <h2>) and the
     legacy one (<h2>Prepared Remarks:</h2> / <h2>Questions & Answers:</h2>)."""
@@ -156,6 +192,7 @@ def parse_transcript(page: str) -> dict:
     else:
         raise ValueError(f"neither '{TRANSCRIPT_H2}' nor '{PREPARED_H2}' <h2> in page")
     return {"title": title, "fiscal": parse_title(title), "template": template,
+            "call_date": parse_call_date(page, sections),
             "raw_text": "\n\n".join(paragraphs), "turns": turns}
 
 
@@ -288,15 +325,16 @@ def _write(c, src: dict, year: int, quarter: int, html: str, parsed: dict) -> in
     raw_text = parsed["raw_text"]
     with c.cursor() as cur:
         cur.execute("""
-            INSERT INTO transcripts (symbol, fiscal_year, fiscal_quarter, call_date, source, source_url,
-                                     raw_html, raw_text, word_count, parsed_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
+            INSERT INTO transcripts (symbol, fiscal_year, fiscal_quarter, call_date, published_date, source,
+                                     source_url, raw_html, raw_text, word_count, parsed_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
             ON CONFLICT (symbol, fiscal_year, fiscal_quarter, source) DO UPDATE SET
-              call_date=EXCLUDED.call_date, source_url=EXCLUDED.source_url, raw_html=EXCLUDED.raw_html,
+              call_date=EXCLUDED.call_date, published_date=EXCLUDED.published_date,
+              source_url=EXCLUDED.source_url, raw_html=EXCLUDED.raw_html,
               raw_text=EXCLUDED.raw_text, word_count=EXCLUDED.word_count, parsed_at=now()
             RETURNING id""",
-            (src["symbol"], year, quarter, src["call_date"], src["source"], src["url"],
-             html, raw_text, len(raw_text.split())))
+            (src["symbol"], year, quarter, parsed["call_date"] or src["call_date"], src["call_date"],
+             src["source"], src["url"], html, raw_text, len(raw_text.split())))
         tid = cur.fetchone()[0]
         _write_segments(cur, tid, parsed["turns"])
         cur.execute("""UPDATE transcript_sources SET status='parsed', fetched_at=now(), error=NULL
@@ -314,14 +352,19 @@ def _write_segments(cur, tid: int, turns: list[dict]) -> None:
          for i, t in enumerate(turns, 1)])
 
 
-def _truncated(c, limit: int | None, ratio: float) -> list[dict]:
-    """Stored transcripts whose segments hold less than `ratio` of the transcript's word_count."""
-    sql = """SELECT t.id, t.symbol, t.fiscal_year, t.fiscal_quarter, t.raw_html,
+def _stale(c, limit: int | None, ratio: float) -> list[dict]:
+    """Stored transcripts to re-parse: segments hold less than `ratio` of the transcript's
+    word_count, or the page date was never parsed (published_date is null)."""
+    sql = """SELECT t.id, t.symbol, t.fiscal_year, t.fiscal_quarter, t.raw_html, t.call_date,
+                    t.published_date, ts.call_date AS source_date,
                     t.word_count, coalesce(sum(s.word_count), 0) AS segment_words
-             FROM transcripts t LEFT JOIN transcript_segments s ON s.transcript_id = t.id
+             FROM transcripts t
+             LEFT JOIN transcript_sources ts ON ts.url = t.source_url
+             LEFT JOIN transcript_segments s ON s.transcript_id = t.id
              WHERE t.raw_html IS NOT NULL
-             GROUP BY t.id
+             GROUP BY t.id, ts.call_date
              HAVING coalesce(sum(s.word_count), 0) < %s * coalesce(t.word_count, 0)
+                 OR t.published_date IS NULL
              ORDER BY t.call_date DESC NULLS LAST, t.id"""
     params: tuple = (ratio,)
     if limit:
@@ -367,8 +410,8 @@ def run(c, limit: int | None = None) -> None:
                     raise ValueError("no speaker turns found")
                 stats["rows"] += _write(c, src, fiscal[0], fiscal[1], html, parsed)
                 ok += 1
-                log.info("transcripts: %s Q%d %d parsed (%s template), %d turns (%s)", src["symbol"], fiscal[1],
-                         fiscal[0], parsed["template"], len(parsed["turns"]), src["url"])
+                log.info("transcripts: %s Q%d %d parsed (%s template), %d turns, call date %s (%s)", src["symbol"],
+                         fiscal[1], fiscal[0], parsed["template"], len(parsed["turns"]), parsed["call_date"], src["url"])
             except Exception as e:  # noqa: BLE001
                 failed += 1
                 log.warning("transcripts: %s failed: %s (%s)", src["symbol"], e, src["url"])
@@ -385,11 +428,12 @@ REPARSE_RATIO = 0.7
 
 
 def reparse(c, limit: int | None = None) -> None:
-    """Re-run the parser on stored raw_html (no HTTP) for every transcript whose segments
-    hold less than REPARSE_RATIO of its word_count; rewrite raw_text and its segments."""
+    """Re-run the parser on stored raw_html (no HTTP) for every transcript whose segments hold
+    less than REPARSE_RATIO of its word_count or whose page date was never parsed; rewrite
+    raw_text, call_date/published_date and the segments."""
     with db.run_log(c, "transcripts_reparse") as stats:
-        rows = _truncated(c, limit, REPARSE_RATIO)
-        log.info("transcripts: reparse %d transcripts with segments under %.0f%% of word_count%s",
+        rows = _stale(c, limit, REPARSE_RATIO)
+        log.info("transcripts: reparse %d transcripts (segments under %.0f%% of word_count or no page date)%s",
                  len(rows), REPARSE_RATIO * 100, f" (limit {limit})" if limit else "")
         ok = failed = 0
         for i, t in enumerate(rows, 1):
@@ -399,16 +443,19 @@ def reparse(c, limit: int | None = None) -> None:
                 if not parsed["turns"]:
                     raise ValueError("no speaker turns found")
                 raw_text = parsed["raw_text"]
+                published = t["published_date"] or t["source_date"] or t["call_date"]
+                call_date = parsed["call_date"] or t["call_date"]
                 with c.cursor() as cur:
-                    cur.execute("UPDATE transcripts SET raw_text=%s, word_count=%s, parsed_at=now() WHERE id=%s",
-                                (raw_text, len(raw_text.split()), t["id"]))
+                    cur.execute("""UPDATE transcripts SET raw_text=%s, word_count=%s, call_date=%s,
+                                   published_date=%s, parsed_at=now() WHERE id=%s""",
+                                (raw_text, len(raw_text.split()), call_date, published, t["id"]))
                     _write_segments(cur, t["id"], parsed["turns"])
                 c.commit()
                 stats["rows"] += 1 + len(parsed["turns"])
                 ok += 1
                 seg_words = sum(len(x["text"].split()) for x in parsed["turns"])
-                log.info("transcripts: reparsed %s (%s template): %d turns, segment words %s -> %d",
-                         label, parsed["template"], len(parsed["turns"]), t["segment_words"], seg_words)
+                log.info("transcripts: reparsed %s (%s template): %d turns, segment words %s -> %d, call date %s",
+                         label, parsed["template"], len(parsed["turns"]), t["segment_words"], seg_words, call_date)
             except Exception as e:  # noqa: BLE001
                 c.rollback()
                 failed += 1
