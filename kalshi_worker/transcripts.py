@@ -78,11 +78,21 @@ P_RE = re.compile(r"<p[^>]*>(.*?)</p>", re.S | re.I)
 TURN_RE = re.compile(r"<p><strong>([^<:]+):</strong>\s*(.*?)</p>", re.S)
 TRANSCRIPT_H2 = "full conference call transcript"
 PARTICIPANTS_H2 = "call participants"
+# legacy (pre-April-2025) template: sections by <h2>, speaker lines <p><strong>Name</strong> -- <em>Title</em></p>
+PREPARED_H2 = "prepared remarks"
+QA_H2 = "questions & answers"
+LEGACY_SPEAKER_RE = re.compile(
+    r"<p[^>]*>\s*<strong>([^<]+)</strong>\s*(?:(?:--|&mdash;|—|–)\s*<em>([^<]*)</em>)?\s*</p>", re.S | re.I)
+
+
+BLOCK_TAG_RE = re.compile(r"</?(?:p|div|li|ul|ol|h\d|br|tr|td|th|table|blockquote)\b[^>]*>", re.I)
 
 
 def _text(fragment: str) -> str:
-    """HTML fragment -> plain text: tags out, entities decoded, whitespace collapsed."""
-    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", fragment))).strip()
+    """HTML fragment -> plain text: block tags and <br> become a space, inline tags (<em>,
+    <strong>, <a>) vanish, entities are decoded, whitespace is collapsed."""
+    fragment = BLOCK_TAG_RE.sub(" ", fragment)
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", fragment))).strip()
 
 
 def parse_title(title: str | None) -> tuple[int, int] | None:
@@ -132,17 +142,29 @@ def _is_boilerplate(text: str) -> bool:
 
 
 def parse_transcript(page: str) -> dict:
-    """Return {"title", "fiscal": (year, quarter) | None, "raw_text", "turns": [...]}, where each
-    turn is {"speaker", "speaker_title", "role", "section", "text"} in page order. Only the
-    HTML after the "Full Conference Call Transcript" <h2> is read for turns. Roles: Operator by
-    name; speakers listed under "CALL PARTICIPANTS" are exec (or analyst when the title says
-    so); unlisted speakers are analyst when all their turns are in Q&A, else unknown."""
+    """Return {"title", "fiscal": (year, quarter) | None, "template", "raw_text", "turns": [...]},
+    where each turn is {"speaker", "speaker_title", "role", "section", "text"} in page order.
+    Two Fool templates: the current one (a "Full Conference Call Transcript" <h2>) and the
+    legacy one (<h2>Prepared Remarks:</h2> / <h2>Questions & Answers:</h2>)."""
     tm = re.search(r"<title[^>]*>(.*?)</title>", page, re.S | re.I)
     title = _text(tm.group(1)) if tm else None
     sections = _sections(page)
+    if _section(sections, TRANSCRIPT_H2) is not None:
+        template, (turns, paragraphs) = "current", _parse_current(sections)
+    elif _section(sections, PREPARED_H2) is not None:
+        template, (turns, paragraphs) = "legacy", _parse_legacy(sections)
+    else:
+        raise ValueError(f"neither '{TRANSCRIPT_H2}' nor '{PREPARED_H2}' <h2> in page")
+    return {"title": title, "fiscal": parse_title(title), "template": template,
+            "raw_text": "\n\n".join(paragraphs), "turns": turns}
+
+
+def _parse_current(sections: dict[str, str]) -> tuple[list[dict], list[str]]:
+    """Current template. Only the HTML after the "Full Conference Call Transcript" <h2> is read
+    for turns. Roles: Operator by name; speakers listed under "CALL PARTICIPANTS" are exec (or
+    analyst when the title says so); unlisted speakers are analyst when all their turns are in
+    Q&A, else unknown."""
     body = _section(sections, TRANSCRIPT_H2)
-    if body is None:
-        raise ValueError(f"no '{TRANSCRIPT_H2}' <h2> in page")
     participants = _participants(_section(sections, PARTICIPANTS_H2))
 
     turns: list[dict] = []
@@ -186,7 +208,52 @@ def parse_transcript(page: str) -> dict:
         else:                                  # spoke in prepared remarks but isn't listed
             t["role"] = "unknown"
 
-    return {"title": title, "fiscal": parse_title(title), "raw_text": "\n\n".join(paragraphs), "turns": turns}
+    return turns, paragraphs
+
+
+def _parse_legacy(sections: dict[str, str]) -> tuple[list[dict], list[str]]:
+    """Legacy template. Turns live under <h2>Prepared Remarks:</h2> and <h2>Questions &
+    Answers:</h2> (the parser stops at <h2>Call participants:</h2>). A speaker line is
+    <p><strong>Name</strong> -- <em>Title</em></p> (Operator has no title); every following <p>
+    up to the next speaker line is that speaker's text, joined with a space. Roles: operator
+    for Operator, analyst when the title contains "Analyst", exec otherwise."""
+    turns: list[dict] = []
+    paragraphs: list[str] = []
+    for section, key in (("prepared", PREPARED_H2), ("qa", QA_H2)):
+        body = _section(sections, key)
+        if body is None:
+            continue
+        cur: dict | None = None
+        for m in P_RE.finditer(body):
+            sp = LEGACY_SPEAKER_RE.fullmatch(m.group(0))
+            if sp:
+                name = _text(sp.group(1))
+                ttl = _text(sp.group(2)) if sp.group(2) else None
+                if name.lower() in NOT_SPEAKERS:
+                    cur = None
+                    continue
+                if name.lower() == "operator":
+                    role = "operator"
+                elif ttl and "analyst" in ttl.lower():
+                    role = "analyst"
+                else:
+                    role = "exec"
+                cur = {"speaker": name, "speaker_title": ttl, "role": role, "section": section, "text": ""}
+                turns.append(cur)
+                continue
+            text = _text(m.group(1))
+            if not text or _is_boilerplate(text):
+                continue
+            if re.match(r"^(?:Duration|Contents):", text):
+                paragraphs.append(text)
+                continue
+            if cur is None:
+                paragraphs.append(text)
+                continue
+            cur["text"] = f"{cur['text']} {text}".strip()
+            paragraphs.append(f"{cur['speaker']}: {text}")
+    turns = [t for t in turns if t["text"]]
+    return turns, paragraphs
 
 
 # --------------------------------------------------------------------------------- db
@@ -264,8 +331,8 @@ def run(c, limit: int | None = None) -> None:
                     raise ValueError("no speaker turns found")
                 stats["rows"] += _write(c, src, fiscal[0], fiscal[1], html, parsed)
                 ok += 1
-                log.info("transcripts: %s Q%d %d parsed, %d turns (%s)", src["symbol"], fiscal[1], fiscal[0],
-                         len(parsed["turns"]), src["url"])
+                log.info("transcripts: %s Q%d %d parsed (%s template), %d turns (%s)", src["symbol"], fiscal[1],
+                         fiscal[0], parsed["template"], len(parsed["turns"]), src["url"])
             except Exception as e:  # noqa: BLE001
                 failed += 1
                 log.warning("transcripts: %s failed: %s (%s)", src["symbol"], e, src["url"])
