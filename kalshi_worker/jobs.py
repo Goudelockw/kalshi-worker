@@ -59,10 +59,12 @@ def _market_rows(c, where: str, params: tuple = ()) -> list[dict]:
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def _batch_candles(k: KalshiClient, c, tickers: list[str], period: int, start_ts: int, end_ts: int) -> int:
+def _batch_candles(k: KalshiClient, c, tickers: list[str], period: int, start_ts: int, end_ts: int,
+                   on_done=None) -> int:
     """Candles for tickers sharing one window via the batch endpoint. Calls are sized so none
     asks for more than BATCH_CANDLES candles: fewer tickers per call for long windows, and
-    time-sliced when a single ticker overflows. Failed calls are logged and skipped."""
+    time-sliced when a single ticker overflows. Failed calls are logged and skipped; `on_done`
+    (if given) is called with each chunk of tickers whose every call succeeded, before commit."""
     if not tickers or start_ts >= end_ts:
         return 0
     per_ticker = (end_ts - start_ts) // (period * 60) + 1
@@ -71,16 +73,20 @@ def _batch_candles(k: KalshiClient, c, tickers: list[str], period: int, start_ts
     n = 0
     for i in range(0, len(tickers), size):
         chunk = tickers[i:i + size]
+        ok = True
         for s in range(start_ts, end_ts, step):
             try:
                 by_ticker = k.candlesticks_batch(chunk, s, min(s + step, end_ts), period)
             except Exception as e:  # noqa: BLE001
                 log.warning("candles batch failed (%s..%s, period %d): %s", chunk[0], chunk[-1], period, e)
+                ok = False
                 continue
             for t, candles in by_ticker.items():
                 if candles:
                     n += db.insert_candles(c, t, period, candles)
-            c.commit()
+        if ok and on_done:
+            on_done(chunk)
+        c.commit()
     return n
 
 
@@ -98,16 +104,30 @@ def _life_windows(rows: list[dict], period: int) -> dict[tuple[int, int], list[s
 
 
 # --------------------------------------------------------------------------- backfill
+SETTLED = "result <> '' AND ticker NOT LIKE 'KXMVE%%'"
+
+
+def _mark_checked(c, tickers: list[str]) -> None:
+    with c.cursor() as cur:
+        cur.execute("UPDATE markets SET daily_checked_at = now() WHERE ticker = ANY(%s)", (list(tickers),))
+
+
+def _daily_progress(c) -> tuple[int, int]:
+    """(settled markets with daily_checked_at set, settled markets) excluding KXMVE."""
+    with c.cursor() as cur:
+        cur.execute(f"SELECT count(*) FILTER (WHERE daily_checked_at IS NOT NULL), count(*) FROM markets WHERE {SETTLED}")
+        return cur.fetchone()
+
+
 def backfill(k: KalshiClient, c) -> None:
-    """One-time: daily candles for every settled market that has none yet, newest first.
-    Markets settled after the /historical/cutoff go through the batch endpoint (grouped by
-    life window, up to BATCH_CANDLE_TICKERS per call); older ones go one at a time through
-    /historical/markets/{ticker}/candlesticks, last. Resumable: the candle-less query skips
-    whatever already landed; sync_state('backfill_candles').meta tracks progress."""
+    """One-time: daily candles for every settled market not yet checked (markets.daily_checked_at
+    is null), newest first. Markets settled after the /historical/cutoff go through the batch
+    endpoint (grouped by life window, up to BATCH_CANDLE_TICKERS per call); older ones go one
+    at a time through /historical/markets/{ticker}/candlesticks, last. daily_checked_at is set
+    after each market once its fetch succeeded, whether or not candles came back, so a rerun
+    only revisits markets whose fetch failed. Progress is checked/settled market counts."""
     with db.run_log(c, "backfill") as stats:
-        rows = _market_rows(c, """result <> '' AND ticker NOT LIKE %s
-            AND NOT EXISTS (SELECT 1 FROM candles WHERE candles.ticker = markets.ticker AND period_minutes = %s)
-            ORDER BY settled_time DESC NULLS LAST""", ("KXMVE%", DAY))
+        rows = _market_rows(c, f"{SETTLED} AND daily_checked_at IS NULL ORDER BY settled_time DESC NULLS LAST")
         cutoff = k.cutoff()
         cutoff_ts = db._ts(cutoff.get("market_settled_ts") or cutoff.get("settled_ts"))
 
@@ -117,18 +137,21 @@ def backfill(k: KalshiClient, c) -> None:
 
         recent = [m for m in rows if not old(m)]
         historical = [m for m in rows if old(m)]
-        total, done = len(rows), 0
-        log.info("backfill: %d settled markets without daily candles (%d batch, %d historical)",
-                 total, len(recent), len(historical))
+        done = 0
+        checked, settled = _daily_progress(c)
+        log.info("backfill: %d/%d settled markets checked for daily candles; %d to do (%d batch, %d historical)",
+                 checked, settled, len(rows), len(recent), len(historical))
 
         def checkpoint(final: bool = False) -> None:
-            db.set_state(c, "backfill_candles", meta={"done": done, "total": total, "complete": final})
+            checked, settled = _daily_progress(c)
+            db.set_state(c, "backfill_candles", meta={"checked": checked, "settled": settled, "complete": final})
             c.commit()
-            log.info("backfill: %d/%d markets, %d candles", done, total, stats["rows"])
+            log.info("backfill: %d/%d settled markets checked (%.1f%%), %d candles this run",
+                     checked, settled, 100 * checked / settled if settled else 0, stats["rows"])
 
         with _stage("backfill", f"batch daily candles ({len(recent)} markets)"):
             for (s, e), tickers in _life_windows(recent, DAY).items():
-                stats["rows"] += _batch_candles(k, c, tickers, DAY, s, e)
+                stats["rows"] += _batch_candles(k, c, tickers, DAY, s, e, on_done=lambda chunk: _mark_checked(c, chunk))
                 prev, done = done, done + len(tickers)
                 if prev // 50 != done // 50:
                     checkpoint()
@@ -137,6 +160,7 @@ def backfill(k: KalshiClient, c) -> None:
             for m in historical:
                 try:
                     stats["rows"] += load_candles(k, c, m, DAY, historical=True)
+                    _mark_checked(c, [m["ticker"]])
                 except Exception as e:  # noqa: BLE001
                     log.warning("historical candles failed for %s: %s", m["ticker"], e)
                 done += 1
