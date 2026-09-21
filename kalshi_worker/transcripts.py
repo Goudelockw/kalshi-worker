@@ -7,12 +7,12 @@ write one transcripts row plus its transcript_segments. One second between reque
 """
 from __future__ import annotations
 
+import html
 import logging
 import re
 import time
 
 import httpx
-from bs4 import BeautifulSoup, Tag
 
 from . import db
 
@@ -67,9 +67,17 @@ def fetch(http: httpx.Client, url: str, retries: int = 3) -> str:
 
 
 # ------------------------------------------------------------------------------ parse
-def _text(el: Tag | str) -> str:
-    s = el if isinstance(el, str) else el.get_text(" ", strip=True)
-    return re.sub(r"\s+", " ", s).strip()
+H2_RE = re.compile(r"<h2[^>]*>(.*?)</h2>", re.S | re.I)
+P_RE = re.compile(r"<p[^>]*>(.*?)</p>", re.S | re.I)
+# a speaking turn: <p><strong>Name:</strong> text</p>, colon inside the <strong>, no title
+TURN_RE = re.compile(r"<p><strong>([^<:]+):</strong>\s*(.*?)</p>", re.S)
+TRANSCRIPT_H2 = "full conference call transcript"
+PARTICIPANTS_H2 = "call participants"
+
+
+def _text(fragment: str) -> str:
+    """HTML fragment -> plain text: tags out, entities decoded, whitespace collapsed."""
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", fragment))).strip()
 
 
 def parse_title(title: str | None) -> tuple[int, int] | None:
@@ -78,40 +86,40 @@ def parse_title(title: str | None) -> tuple[int, int] | None:
     return (int(m.group(2)), int(m.group(1))) if m else None
 
 
-def _article_body(soup: BeautifulSoup) -> Tag:
-    for sel in ("div.article-body", "div.tailwind-article-body", "div[class*=article-body]", "article", "body"):
-        el = soup.select_one(sel)
-        if el is not None:
-            return el
-    return soup
+def _sections(page: str) -> dict[str, str]:
+    """{h2 text (lower-cased): html between that <h2> and the next one}."""
+    heads = list(H2_RE.finditer(page))
+    out: dict[str, str] = {}
+    for i, h in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(page)
+        out.setdefault(_text(h.group(1)).lower().rstrip(":"), page[h.end():end])
+    return out
 
 
-def _split_name_title(p: Tag) -> tuple[str, str | None] | None:
-    """A speaker header or participant line: '<strong>Name</strong> -- <em>Title</em>' or plain
-    'Name -- Title'. Returns (name, title) or None when the paragraph doesn't look like one."""
-    full = _text(p)
-    if not full or len(full) > 160:
-        return None
-    parts = SEPARATOR_RE.split(full, 1)
-    name = parts[0].strip().rstrip(":")
-    title = parts[1].strip() or None if len(parts) > 1 else None
-    strong = p.find("strong")
-    if strong is not None:
-        return (name, title) if _text(strong).rstrip(":") == name else None
-    return (name, title) if title and len(name.split()) <= 5 else None
+def _section(sections: dict[str, str], prefix: str) -> str | None:
+    return next((v for k, v in sections.items() if k.startswith(prefix)), None)
 
 
-def _inline_turn(p: Tag) -> tuple[str, str] | None:
-    """'<p><strong>Name:</strong> text</p>' -> (name, text)."""
-    first = next((ch for ch in p.children if not (isinstance(ch, str) and not ch.strip())), None)
-    if not isinstance(first, Tag) or first.name != "strong":
-        return None
-    label = _text(first)
-    if not label.endswith(":"):
-        return None
-    name = label[:-1].strip()
-    text = _text(p)[len(label):].strip()
-    return (name, text) if name else None
+def _participants(section_html: str | None) -> dict[str, str | None]:
+    """'CALL PARTICIPANTS' lines -> {name: title}. Lines look like 'Name -- Title', with the
+    name possibly in <strong>; anything after the name (minus separators) is the title."""
+    out: dict[str, str | None] = {}
+    for m in P_RE.finditer(section_html or ""):
+        strong = re.search(r"<strong>(.*?)</strong>", m.group(1), re.S)
+        text = _text(m.group(1))
+        if not text or len(text) > 160:
+            continue
+        if strong is not None and _text(strong.group(1)):
+            name = _text(strong.group(1)).rstrip(":")
+            title = text[len(_text(strong.group(1))):] if text.startswith(_text(strong.group(1))) else text
+        else:
+            parts = SEPARATOR_RE.split(text, 1)
+            if len(parts) < 2 or len(parts[0].split()) > 5:
+                continue
+            name, title = parts[0], parts[1]
+        title = re.sub(r"^[\s:–—-]+", "", title).strip() or None
+        out.setdefault(name.strip(), title)
+    return out
 
 
 def _is_boilerplate(text: str) -> bool:
@@ -119,68 +127,35 @@ def _is_boilerplate(text: str) -> bool:
     return any(b in low for b in BOILERPLATE)
 
 
-def parse_transcript(html: str) -> dict:
+def parse_transcript(page: str) -> dict:
     """Return {"title", "fiscal": (year, quarter) | None, "raw_text", "turns": [...]}, where each
-    turn is {"speaker", "speaker_title", "role", "section", "text"} in page order."""
-    soup = BeautifulSoup(html, "html.parser")
-    title = _text(soup.title.get_text()) if soup.title else None
-    body = _article_body(soup)
+    turn is {"speaker", "speaker_title", "role", "section", "text"} in page order. Only the
+    HTML after the "Full Conference Call Transcript" <h2> is read for turns; roles come from
+    the "CALL PARTICIPANTS" <h2> section."""
+    tm = re.search(r"<title[^>]*>(.*?)</title>", page, re.S | re.I)
+    title = _text(tm.group(1)) if tm else None
+    sections = _sections(page)
+    body = _section(sections, TRANSCRIPT_H2)
+    if body is None:
+        raise ValueError(f"no '{TRANSCRIPT_H2}' <h2> in page")
+    participants = _participants(_section(sections, PARTICIPANTS_H2))
 
-    turns: list[dict] = []            # {"speaker", "speaker_title", "text"}
-    paragraphs: list[str] = []        # everything kept for raw_text
-    participants: dict[str, str | None] = {}
-    mode = "body"                     # body | participants
-    header: tuple[str, str | None] | None = None  # pending old-style speaker header
-
-    for el in body.find_all(["p", "h2", "h3", "h4"]):
-        text = _text(el)
-        if not text:
+    turns: list[dict] = []
+    paragraphs: list[str] = []
+    for m in P_RE.finditer(body):
+        raw = m.group(0)
+        turn = TURN_RE.fullmatch(raw) if raw.startswith("<p>") else None
+        if turn:
+            name, text = html.unescape(turn.group(1)).strip(), _text(turn.group(2))
+            if name.lower() in NOT_SPEAKERS:
+                paragraphs.append(f"{name}: {text}")
+            elif text:
+                turns.append({"speaker": name, "text": text})
+                paragraphs.append(f"{name}: {text}")
             continue
-        low = text.lower().rstrip(":")
-        if el.name != "p":
-            if low.startswith("call participants"):
-                mode = "participants"
-            elif mode == "participants":
-                mode = "after"
-            header = None
-            continue
-        if mode == "participants":
-            nt = _split_name_title(el)
-            if nt:
-                participants.setdefault(nt[0], nt[1])
-            continue
-        if mode == "after" or _is_boilerplate(text):
-            continue
-        if low.startswith("call participants"):        # heading rendered as <p>
-            mode = "participants"
-            continue
-
-        inline = _inline_turn(el)
-        if inline and inline[0].lower() in NOT_SPEAKERS:   # e.g. 'Duration: 61 minutes'
+        text = _text(m.group(1))
+        if text and not _is_boilerplate(text):
             paragraphs.append(text)
-            continue
-        if inline:
-            name, body_text = inline
-            if body_text:
-                turns.append({"speaker": name, "speaker_title": None, "text": body_text})
-                paragraphs.append(f"{name}: {body_text}")
-                header = None
-            else:                                       # '<strong>Name:</strong>' alone = header
-                header = (name, None)
-            continue
-        nt = _split_name_title(el)
-        if nt and el.find("strong") is not None and nt[0].lower() not in NOT_SPEAKERS:
-            header = nt                                # '<strong>Name</strong> -- <em>Title</em>'
-            continue
-        if header:
-            name, ttl = header
-            if turns and turns[-1]["speaker"] == name and turns[-1].get("_open"):
-                turns[-1]["text"] += "\n\n" + text
-            else:
-                turns.append({"speaker": name, "speaker_title": ttl, "text": text, "_open": True})
-            paragraphs.append(f"{name}: {text}")
-            continue
-        paragraphs.append(text)
 
     # sections: prepared until the first Operator turn mentioning "question" after remarks began
     section, seen_remarks = "prepared", False
@@ -195,7 +170,7 @@ def parse_transcript(html: str) -> dict:
     prepared_speakers = {t["speaker"] for t in turns if t["section"] == "prepared" and t["speaker"].lower() != "operator"}
     for t in turns:
         name = t["speaker"]
-        ttl = t.get("speaker_title") or participants.get(name)
+        ttl = participants.get(name)
         t["speaker_title"] = ttl
         if name.lower() == "operator":
             t["role"] = "operator"
@@ -205,7 +180,6 @@ def parse_transcript(html: str) -> dict:
             t["role"] = "exec"
         else:
             t["role"] = "unknown"
-        t.pop("_open", None)
 
     return {"title": title, "fiscal": parse_title(title), "raw_text": "\n\n".join(paragraphs), "turns": turns}
 
