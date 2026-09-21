@@ -8,6 +8,7 @@ Ingests Kalshi market history into Neon Postgres (schema from `001_kalshi_schema
 | `backfill` | daily candles for settled markets that have none yet; resumable | one-off (`railway run python -m kalshi_worker backfill`) |
 | `sync` | open/new/closed markets, hourly candles, watchlist trades + 1-min candles | cron service, `0 * * * *` |
 | `reconcile` | lock results and complete candles for recently settled markets | cron service, `15 4 * * *` |
+| `transcripts` | fetch + parse pending Motley Fool earnings-call transcripts into `transcripts` / `transcript_segments`; `--limit N` for testing | on demand (`railway run python -m kalshi_worker transcripts`) |
 | `worker` | always-on; takes an order-book snapshot for watchlist series every N min | default service |
 
 ## Railway setup

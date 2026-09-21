@@ -4,6 +4,7 @@
   python -m kalshi_worker sync         hourly refresh          (Railway cron)
   python -m kalshi_worker reconcile    nightly settlement lock (Railway cron)
   python -m kalshi_worker snapshot     one order-book snapshot pass
+  python -m kalshi_worker transcripts [--limit N]   parse pending Motley Fool transcripts
   python -m kalshi_worker worker       always-on: snapshot every N minutes
 """
 import logging
@@ -16,11 +17,21 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("kalshi_worker")
 
-from . import db, jobs  # noqa: E402  (after load_dotenv so DATABASE_URL is present)
+from . import db, jobs, transcripts  # noqa: E402  (after load_dotenv so DATABASE_URL is present)
 from .client import KalshiClient  # noqa: E402
 
 
-def run(cmd: str) -> None:
+def _opt(name: str, args: list[str]) -> int | None:
+    """--name N or --name=N from the remaining argv."""
+    for i, a in enumerate(args):
+        if a == f"--{name}" and i + 1 < len(args):
+            return int(args[i + 1])
+        if a.startswith(f"--{name}="):
+            return int(a.split("=", 1)[1])
+    return None
+
+
+def run(cmd: str, args: list[str] = ()) -> None:
     k = KalshiClient()
     with db.conn() as c:
         if cmd == "backfill":
@@ -31,6 +42,8 @@ def run(cmd: str) -> None:
             jobs.reconcile(k, c)
         elif cmd == "snapshot":
             jobs.snapshot(k, c, int(os.getenv("SNAPSHOT_INTERVAL_MIN", "5")))
+        elif cmd == "transcripts":
+            transcripts.run(c, limit=_opt("limit", list(args)))
         else:
             raise SystemExit(f"unknown command {cmd!r}")
 
@@ -48,4 +61,4 @@ def worker() -> None:
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "worker"
-    worker() if cmd == "worker" else run(cmd)
+    worker() if cmd == "worker" else run(cmd, sys.argv[2:])
