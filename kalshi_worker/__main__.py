@@ -8,6 +8,9 @@
                                        discover new Fool transcript URLs from the monthly
                                        sitemaps (default 2 months), then parse pending rows;
                                        --reparse re-parses stored HTML instead
+  python -m kalshi_worker filings [--days N]   8-K earnings press releases (Item 2.02 /
+                                       Exhibit 99.1) from SEC EDGAR, last N days (default 3;
+                                       use 1100 for the backfill)
   python -m kalshi_worker worker       always-on: snapshot every N minutes
 """
 import logging
@@ -20,7 +23,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("kalshi_worker")
 
-from . import db, jobs, transcripts  # noqa: E402  (after load_dotenv so DATABASE_URL is present)
+from . import db, filings, jobs, transcripts  # noqa: E402  (after load_dotenv so DATABASE_URL is present)
 from .client import KalshiClient  # noqa: E402
 
 
@@ -51,6 +54,8 @@ def run(cmd: str, args: list[str] = ()) -> None:
             else:
                 transcripts.run(c, limit=_opt("limit", list(args)),
                                 discover_months=_opt("discover-months", list(args)) or transcripts.DISCOVER_MONTHS)
+        elif cmd == "filings":
+            filings.run(c, days=_opt("days", list(args)) or filings.DEFAULT_DAYS)
         else:
             raise SystemExit(f"unknown command {cmd!r}")
 
