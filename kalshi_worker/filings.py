@@ -164,20 +164,55 @@ def html_to_text(doc: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", doc).strip()
 
 
-BOILERPLATE_RE = re.compile(
-    r"forward[- ]looking statements|cautionary statement|safe harbor|(?-i:^About [A-Z])", re.I | re.M)
+PARA_SPLIT_RE = re.compile(r"\n\s*\n")
+BOILERPLATE_PARA_RE = re.compile(
+    r"forward[- ]looking|safe harbor|risks and uncertainties|undertakes? no obligation|private securities litigation", re.I)
+NON_GAAP_HEADING_RE = re.compile(r"^\W*(?:use of |reconciliation of )?non-gaap financial measures\W*$", re.I)
+CONTACT_HEADING_RE = re.compile(
+    r"^\W*(?:contacts?|investor relations|investor contacts?|media contacts?|media relations|press contacts?)\W*$", re.I)
+CORPORATE_WORDS = {"the", "inc", "inc.", "corp", "corp.", "corporation", "co", "co.", "company", "plc", "ltd", "ltd.",
+                   "llc", "holdings", "group", "&"}
 
 
-def split_boilerplate(text: str) -> tuple[str, str]:
-    """(body, boilerplate): the boilerplate starts at the first case-insensitive
-    'forward-looking statements' / 'forward looking statements' / 'cautionary statement' /
-    'safe harbor', or a line starting 'About <Capitalized>', found in the second half of the
-    text. No match: the whole text is body and boilerplate is empty."""
-    text = text or ""
-    m = BOILERPLATE_RE.search(text, len(text) // 2)
-    if not m:
-        return text, ""
-    return text[:m.start()].rstrip(), text[m.start():].strip()
+def _about_pattern(company: str | None) -> re.Pattern:
+    """'About <Company>' paragraph start: the company's first significant name word (SEC names
+    look like 'ADOBE INC.' or 'THE KROGER CO'), or any capitalized word when no name is known."""
+    words = [w for w in re.split(r"\s+", (company or "").strip()) if w and w.lower() not in CORPORATE_WORDS]
+    if words:
+        return re.compile(r"^About\s+" + re.escape(words[0].rstrip(",.")), re.I)
+    return re.compile(r"^About\s+[A-Z]")
+
+
+def _is_heading(para: str) -> bool:
+    return "\n" not in para and len(para.split()) <= 8 and not para.rstrip().endswith(".")
+
+
+def split_boilerplate(text: str, company: str | None = None) -> tuple[str, str]:
+    """Paragraph-level filter -> (body, boilerplate). Paragraphs are separated by blank lines.
+    A paragraph is boilerplate when it mentions forward-looking statements, safe harbor, risks
+    and uncertainties, undertake no obligation or the Private Securities Litigation Reform Act,
+    is a "Non-GAAP Financial Measures" heading, or starts with "About <company>" (a bare About
+    heading also takes the description paragraph that follows it); a paragraph that is exactly
+    a Contact / Investor Relations / Media Contact heading takes everything after it into the
+    boilerplate too. body is the kept paragraphs joined, boilerplate the removed ones."""
+    about = _about_pattern(company)
+    body, boilerplate, after_contact, absorb_next = [], [], False, False
+    for para in PARA_SPLIT_RE.split(text or ""):
+        para = para.strip()
+        if not para:
+            continue
+        if after_contact or CONTACT_HEADING_RE.match(para):
+            after_contact = True
+            boilerplate.append(para)
+        elif absorb_next:
+            boilerplate.append(para)
+            absorb_next = False
+        elif BOILERPLATE_PARA_RE.search(para) or NON_GAAP_HEADING_RE.match(para) or about.match(para):
+            boilerplate.append(para)
+            absorb_next = bool(about.match(para) and _is_heading(para))
+        else:
+            body.append(para)
+    return "\n\n".join(body), "\n\n".join(boilerplate)
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -251,7 +286,7 @@ def run(c, days: int = DEFAULT_DAYS, edgar: Edgar | None = None) -> None:
 
         # 3 + 4. submissions -> new 8-K 2.02 filings -> Exhibit 99.1 text
         candidates = new = failed = 0
-        for i, (symbol, (cik, _name)) in enumerate(sorted(resolved.items()), 1):
+        for i, (symbol, (cik, _name)) in enumerate(sorted(resolved.items()), 1):  # noqa: F841
             try:
                 subs = edgar.json(SUBMISSIONS_URL.format(name=f"CIK{cik}.json"))
             except Exception as e:  # noqa: BLE001
@@ -270,7 +305,7 @@ def run(c, days: int = DEFAULT_DAYS, edgar: Edgar | None = None) -> None:
                         raise ValueError("no exhibit or primary document in archive index")
                     exhibit_url = folder + doc
                     text = html_to_text(edgar.text(exhibit_url))
-                    body, boilerplate = split_boilerplate(text)
+                    body, boilerplate = split_boilerplate(text, _name)
                     filed_at = _parse_ts(f.get("acceptanceDateTime")) or _parse_ts(f.get("filingDate"))
                     if not filed_at:
                         raise ValueError(f"no usable acceptanceDateTime/filingDate ({f.get('filingDate')!r})")
@@ -298,12 +333,14 @@ def reparse(c) -> None:
     """Fill body_text / boilerplate_text for every stored filing that lacks them, from raw_text."""
     with db.run_log(c, "filings_reparse") as stats:
         with c.cursor() as cur:
-            cur.execute("SELECT accession, raw_text FROM filings WHERE body_text IS NULL ORDER BY filed_at DESC")
+            cur.execute("""SELECT f.accession, f.raw_text, cm.name FROM filings f
+                           LEFT JOIN company_map cm ON cm.symbol = f.symbol
+                           WHERE f.body_text IS NULL ORDER BY f.filed_at DESC""")
             rows = cur.fetchall()
         log.info("filings: reparse %d filings without body_text", len(rows))
         split = 0
-        for accession, raw in rows:
-            body, boilerplate = split_boilerplate(raw or "")
+        for accession, raw, company in rows:
+            body, boilerplate = split_boilerplate(raw or "", company)
             with c.cursor() as cur:
                 cur.execute("UPDATE filings SET body_text = %s, boilerplate_text = %s WHERE accession = %s",
                             (body, boilerplate, accession))
