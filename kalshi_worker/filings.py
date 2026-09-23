@@ -164,6 +164,22 @@ def html_to_text(doc: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", doc).strip()
 
 
+BOILERPLATE_RE = re.compile(
+    r"forward[- ]looking statements|cautionary statement|safe harbor|(?-i:^About [A-Z])", re.I | re.M)
+
+
+def split_boilerplate(text: str) -> tuple[str, str]:
+    """(body, boilerplate): the boilerplate starts at the first case-insensitive
+    'forward-looking statements' / 'forward looking statements' / 'cautionary statement' /
+    'safe harbor', or a line starting 'About <Capitalized>', found in the second half of the
+    text. No match: the whole text is body and boilerplate is empty."""
+    text = text or ""
+    m = BOILERPLATE_RE.search(text, len(text) // 2)
+    if not m:
+        return text, ""
+    return text[:m.start()].rstrip(), text[m.start():].strip()
+
+
 def _parse_ts(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -204,9 +220,9 @@ def _known_accessions(c, symbol: str) -> set[str]:
 def _insert_filing(c, row: dict) -> int:
     with c.cursor() as cur:
         cur.execute("""INSERT INTO filings (accession, cik, symbol, form, items, filed_at, period, exhibit_url,
-                                            raw_text, word_count)
+                                            raw_text, word_count, body_text, boilerplate_text)
                        VALUES (%(accession)s, %(cik)s, %(symbol)s, %(form)s, %(items)s, %(filed_at)s, %(period)s,
-                               %(exhibit_url)s, %(raw_text)s, %(word_count)s)
+                               %(exhibit_url)s, %(raw_text)s, %(word_count)s, %(body_text)s, %(boilerplate_text)s)
                        ON CONFLICT (accession) DO NOTHING""", row)
         return cur.rowcount
 
@@ -254,13 +270,15 @@ def run(c, days: int = DEFAULT_DAYS, edgar: Edgar | None = None) -> None:
                         raise ValueError("no exhibit or primary document in archive index")
                     exhibit_url = folder + doc
                     text = html_to_text(edgar.text(exhibit_url))
+                    body, boilerplate = split_boilerplate(text)
                     filed_at = _parse_ts(f.get("acceptanceDateTime")) or _parse_ts(f.get("filingDate"))
                     if not filed_at:
                         raise ValueError(f"no usable acceptanceDateTime/filingDate ({f.get('filingDate')!r})")
                     new += _insert_filing(c, {
                         "accession": acc, "cik": cik, "symbol": symbol, "form": f["form"], "items": f["item_list"],
                         "filed_at": filed_at, "period": _parse_date(f.get("reportDate")), "exhibit_url": exhibit_url,
-                        "raw_text": text, "word_count": len(text.split())})
+                        "raw_text": text, "word_count": len(text.split()),
+                        "body_text": body, "boilerplate_text": boilerplate})
                     c.commit()
                     stats["rows"] += 1
                     log.info("filings: %s %s filed %s -> %s (%d words)", symbol, acc, f["filingDate"], doc, len(text.split()))
@@ -273,3 +291,23 @@ def run(c, days: int = DEFAULT_DAYS, edgar: Edgar | None = None) -> None:
                          i, len(resolved), candidates, new, failed)
         log.info("filings: done (last %d days): %d symbols, %d resolved, %d new 8-K 2.02 candidates, %d stored, %d failed",
                  days, len(symbols), len(resolved), candidates, new, failed)
+
+
+
+def reparse(c) -> None:
+    """Fill body_text / boilerplate_text for every stored filing that lacks them, from raw_text."""
+    with db.run_log(c, "filings_reparse") as stats:
+        with c.cursor() as cur:
+            cur.execute("SELECT accession, raw_text FROM filings WHERE body_text IS NULL ORDER BY filed_at DESC")
+            rows = cur.fetchall()
+        log.info("filings: reparse %d filings without body_text", len(rows))
+        split = 0
+        for accession, raw in rows:
+            body, boilerplate = split_boilerplate(raw or "")
+            with c.cursor() as cur:
+                cur.execute("UPDATE filings SET body_text = %s, boilerplate_text = %s WHERE accession = %s",
+                            (body, boilerplate, accession))
+            stats["rows"] += 1
+            split += bool(boilerplate)
+        c.commit()
+        log.info("filings: reparse done: %d updated, %d with boilerplate split off", len(rows), split)
