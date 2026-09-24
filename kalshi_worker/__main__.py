@@ -12,6 +12,8 @@
                                        (Item 2.02 / Exhibit 99.1) from SEC EDGAR, last N days
                                        (default 3; 1100 for the backfill); --reparse only
                                        splits body/boilerplate for stored rows lacking it
+  python -m kalshi_worker reactions [--days N]   1-minute candles around earnings press
+                                       releases for mention markets (default 3; 90 for backfill)
   python -m kalshi_worker worker       always-on: snapshot every N minutes
 """
 import logging
@@ -24,7 +26,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("kalshi_worker")
 
-from . import db, filings, jobs, transcripts  # noqa: E402  (after load_dotenv so DATABASE_URL is present)
+from . import db, filings, jobs, reactions, transcripts  # noqa: E402  (after load_dotenv so DATABASE_URL is present)
 from .client import KalshiClient  # noqa: E402
 
 
@@ -60,6 +62,8 @@ def run(cmd: str, args: list[str] = ()) -> None:
                 filings.reparse(c)
             else:
                 filings.run(c, days=_opt("days", list(args)) or filings.DEFAULT_DAYS)
+        elif cmd == "reactions":
+            reactions.run(k, c, days=_opt("days", list(args)) or reactions.DEFAULT_DAYS)
         else:
             raise SystemExit(f"unknown command {cmd!r}")
 
