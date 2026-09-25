@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import time
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
@@ -26,6 +27,8 @@ ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc}/"
 DEFAULT_DAYS = 3
 RPS = 8.0
 EARNINGS_ITEM = "2.02"
+EVENT_FORMS = ("8-K", "8-K/A")
+EVENT_ITEMS = ("1.01", "1.02", "2.01", "2.05", "2.06", "5.02")   # agreements, M&A, restructuring, impairment, exec change
 
 HREF_RE = re.compile(r'href="([^"]+)"', re.I)
 EXHIBIT_RE = re.compile(r"(?:ex(?:hibit)?[-_]?99|99[.\-_]1)", re.I)
@@ -126,6 +129,19 @@ def earnings_8ks(filings: list[dict], since: date) -> list[dict]:
     for f in filings:
         items = [x.strip() for x in (f.get("items") or "").split(",") if x.strip()]
         if f.get("form") != "8-K" or EARNINGS_ITEM not in items or not f.get("filingDate"):
+            continue
+        if date.fromisoformat(f["filingDate"]) < since:
+            continue
+        out.append({**f, "item_list": items})
+    return out
+
+
+def event_8ks(filings: list[dict], since: date) -> list[dict]:
+    """8-Ks and 8-K/As carrying any corporate-event item (EVENT_ITEMS) filed on or after `since`."""
+    out = []
+    for f in filings:
+        items = [x.strip() for x in (f.get("items") or "").split(",") if x.strip()]
+        if f.get("form") not in EVENT_FORMS or not set(items) & set(EVENT_ITEMS) or not f.get("filingDate"):
             continue
         if date.fromisoformat(f["filingDate"]) < since:
             continue
@@ -246,6 +262,61 @@ def _upsert_company(c, symbol: str, cik: str, name: str) -> None:
                     (symbol, cik, name))
 
 
+def _update_sic(c, symbol: str, sic: str | None, sic_description: str | None) -> None:
+    with c.cursor() as cur:
+        cur.execute("UPDATE company_map SET sic = %s, sic_description = %s, updated_at = now() WHERE symbol = %s",
+                    (sic or None, sic_description or None, symbol))
+
+
+def _known_events(c, symbol: str) -> set[str]:
+    with c.cursor() as cur:
+        cur.execute("SELECT accession FROM corporate_events WHERE symbol = %s", (symbol,))
+        return {r[0] for r in cur.fetchall()}
+
+
+def _upsert_event(c, row: dict) -> None:
+    with c.cursor() as cur:
+        cur.execute("""INSERT INTO corporate_events (accession, symbol, cik, form, items, filed_at, doc_url, raw_text)
+                       VALUES (%(accession)s, %(symbol)s, %(cik)s, %(form)s, %(items)s, %(filed_at)s, %(doc_url)s,
+                               %(raw_text)s)
+                       ON CONFLICT (accession) DO UPDATE SET
+                         symbol = EXCLUDED.symbol, cik = EXCLUDED.cik, form = EXCLUDED.form, items = EXCLUDED.items,
+                         filed_at = EXCLUDED.filed_at, doc_url = EXCLUDED.doc_url, raw_text = EXCLUDED.raw_text,
+                         fetched_at = now()""", row)
+
+
+def _store_events(edgar: "Edgar", c, symbol: str, cik: str, subs: dict, since: date,
+                  counts: "Counter[str]") -> tuple[int, int, int]:
+    """Corporate-event 8-Ks for one company: returns (candidates, stored, failed); `counts` gets
+    one tick per stored filing for each EVENT_ITEMS code it carries."""
+    known = _known_events(c, symbol)
+    todo = [f for f in event_8ks(recent_filings(subs), since) if f["accessionNumber"] not in known]
+    stored = failed = 0
+    for f in todo:
+        acc = f["accessionNumber"]
+        try:
+            if not f.get("primaryDocument"):
+                raise ValueError("no primaryDocument")
+            doc_url = ARCHIVE_URL.format(cik=int(cik), acc=acc.replace("-", "")) + f["primaryDocument"]
+            text = html_to_text(edgar.text(doc_url))
+            filed_at = _parse_ts(f.get("acceptanceDateTime")) or _parse_ts(f.get("filingDate"))
+            if not filed_at:
+                raise ValueError(f"no usable acceptanceDateTime/filingDate ({f.get('filingDate')!r})")
+            _upsert_event(c, {"accession": acc, "symbol": symbol, "cik": cik, "form": f["form"],
+                              "items": f["item_list"], "filed_at": filed_at, "doc_url": doc_url, "raw_text": text})
+            c.commit()
+            stored += 1
+            hit = [i for i in f["item_list"] if i in EVENT_ITEMS]
+            counts.update(hit)
+            log.info("filings: %s %s %s items %s filed %s (%d words)", symbol, f["form"], acc, ",".join(hit),
+                     f["filingDate"], len(text.split()))
+        except Exception as e:  # noqa: BLE001
+            c.rollback()
+            failed += 1
+            log.warning("filings: %s event %s failed: %s", symbol, acc, e)
+    return len(todo), stored, failed
+
+
 def _known_accessions(c, symbol: str) -> set[str]:
     with c.cursor() as cur:
         cur.execute("SELECT accession FROM filings WHERE symbol = %s", (symbol,))
@@ -286,6 +357,8 @@ def run(c, days: int = DEFAULT_DAYS, edgar: Edgar | None = None) -> None:
 
         # 3 + 4. submissions -> new 8-K 2.02 filings -> Exhibit 99.1 text
         candidates = new = failed = 0
+        ev_candidates = ev_stored = ev_failed = 0
+        ev_counts: Counter[str] = Counter()
         for i, (symbol, (cik, _name)) in enumerate(sorted(resolved.items()), 1):  # noqa: F841
             try:
                 subs = edgar.json(SUBMISSIONS_URL.format(name=f"CIK{cik}.json"))
@@ -293,6 +366,8 @@ def run(c, days: int = DEFAULT_DAYS, edgar: Edgar | None = None) -> None:
                 failed += 1
                 log.warning("filings: %s submissions failed: %s", symbol, e)
                 continue
+            _update_sic(c, symbol, subs.get("sic"), subs.get("sicDescription"))
+            c.commit()
             known = _known_accessions(c, symbol)
             todo = [f for f in earnings_8ks(recent_filings(subs), since) if f["accessionNumber"] not in known]
             candidates += len(todo)
@@ -321,11 +396,18 @@ def run(c, days: int = DEFAULT_DAYS, edgar: Edgar | None = None) -> None:
                     c.rollback()
                     failed += 1
                     log.warning("filings: %s %s failed: %s", symbol, acc, e)
+            n_cand, n_stored, n_failed = _store_events(edgar, c, symbol, cik, subs, since, ev_counts)
+            ev_candidates, ev_stored, ev_failed = ev_candidates + n_cand, ev_stored + n_stored, ev_failed + n_failed
+            stats["rows"] += n_stored
             if i % 25 == 0 or i == len(resolved):
-                log.info("filings: %d/%d symbols done; %d candidate filings, %d stored, %d failed",
-                         i, len(resolved), candidates, new, failed)
+                log.info("filings: %d/%d symbols done; %d candidate filings, %d stored, %d failed; "
+                         "%d corporate events stored, %d failed", i, len(resolved), candidates, new, failed,
+                         ev_stored, ev_failed)
         log.info("filings: done (last %d days): %d symbols, %d resolved, %d new 8-K 2.02 candidates, %d stored, %d failed",
                  days, len(symbols), len(resolved), candidates, new, failed)
+        log.info("filings: corporate events (last %d days): %d new candidates, %d stored, %d failed; by item: %s",
+                 days, ev_candidates, ev_stored, ev_failed,
+                 ", ".join(f"{item}={ev_counts.get(item, 0)}" for item in EVENT_ITEMS))
 
 
 
