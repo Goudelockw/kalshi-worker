@@ -173,9 +173,10 @@ def backfill(k: KalshiClient, c) -> None:
 OPEN = "status IN ('active','initialized','inactive')"
 
 
-def _sync_events(k: KalshiClient, c, **params) -> int:
+def _sync_events(k: KalshiClient, c, seen: set[str] | None = None, **params) -> int:
     """Page /events with nested markets; upsert each event row, then its markets with
-    series_ticker/event_ticker taken from the parent. Returns rows written."""
+    series_ticker/event_ticker taken from the parent. Adds every market ticker to `seen` if
+    given. Returns rows written."""
     n = 0
     for page, _ in k.events(with_nested_markets="true", **params):
         events, markets = [], []
@@ -186,6 +187,8 @@ def _sync_events(k: KalshiClient, c, **params) -> int:
                 m["series_ticker"] = ev.get("series_ticker")
             events.append(ev)
             markets.extend(nested)
+        if seen is not None:
+            seen.update(m["ticker"] for m in markets)
         n += db.upsert_events(c, events)
         n += db.upsert_markets(c, markets)  # drops KXMVE* tickers
         c.commit()
@@ -196,29 +199,69 @@ def _open_markets(c, series: list[str]) -> list[dict]:
     return _market_rows(c, f"series_ticker = ANY(%s) AND {OPEN}", (series,))
 
 
-def sync(k: KalshiClient, c) -> None:
-    """Hourly: series; open events + markets and ones closed/settled in the last 3 days;
-    then, for open markets in watchlisted series only, recent hourly candles, 1-minute
-    candles (minute_candles) and new trades (trades)."""
+# ------------------------------------------------------------------------ stale sweep
+SWEEP_MAX = 20_000
+SWEEP_CHUNK = 100
+FINAL = ("finalized", "settled")
+
+
+def stale_sweep(k: KalshiClient, c, seen: set[str] = frozenset(), max_markets: int = SWEEP_MAX) -> int:
+    """Refresh markets that have dropped out of the open-events pull: every non-KXMVE market
+    whose status is not finalized/settled and that wasn't seen this run, least recently updated
+    first, up to `max_markets`. Fetched through GET /markets?tickers=... in chunks of 100 and
+    upserted, so status, result, close/settlement time, settlement value and prices refresh.
+    Tickers Kalshi doesn't return are left unchanged and counted. Returns rows written."""
+    # anti-join on unnest(): `NOT (ticker = ANY(...))` with ~150k seen tickers is several times slower
+    with c.cursor() as cur:
+        cur.execute("""
+            SELECT m.ticker FROM markets m
+            WHERE coalesce(m.status, '') <> ALL(%s) AND coalesce(m.series_ticker, '') NOT LIKE %s
+              AND NOT EXISTS (SELECT 1 FROM unnest(%s::text[]) s(t) WHERE s.t = m.ticker)
+            ORDER BY m.updated_at ASC NULLS FIRST, m.ticker
+            LIMIT %s""", (list(FINAL), "KXMVE%", list(seen), max_markets))
+        tickers = [r[0] for r in cur.fetchall()]
+    n = missing = final = failed = 0
+    for i in range(0, len(tickers), SWEEP_CHUNK):
+        chunk = tickers[i:i + SWEEP_CHUNK]
+        try:
+            got: list[dict] = []
+            for page, _ in k.markets(tickers=",".join(chunk)):
+                got.extend(page)
+            n += db.upsert_markets(c, got)
+            c.commit()
+        except Exception as e:  # noqa: BLE001
+            c.rollback()
+            failed += len(chunk)
+            log.warning("stale sweep: chunk %s..%s failed: %s", chunk[0], chunk[-1], e)
+            continue
+        returned = {m["ticker"] for m in got}
+        missing += sum(1 for t in chunk if t not in returned)
+        final += sum(1 for m in got if m.get("status") in FINAL)
+    log.info("stale sweep: %d stale markets queried (max %d), %d upserted, %d now finalized/settled, "
+             "%d not returned by Kalshi (left unchanged), %d in failed chunks",
+             len(tickers), max_markets, n, final, missing, failed)
+    return n
+
+
+def sweep(k: KalshiClient, c, max_markets: int = SWEEP_MAX) -> None:
+    """One-off catch-up: just the stale sweep (nothing counts as seen)."""
+    with db.run_log(c, "sweep") as stats:
+        stats["rows"] += stale_sweep(k, c, max_markets=max_markets)
+
+
+def sync(k: KalshiClient, c, sweep_max: int = SWEEP_MAX) -> None:
+    """Hourly: series; open events + markets; then, for open markets in watchlisted series
+    only, recent hourly candles, 1-minute candles (minute_candles) and new trades (trades);
+    finally the stale sweep over non-final markets that weren't in the open-events pull."""
     with db.run_log(c, "sync") as stats:
         with _stage("sync", "series"):
             for page, _ in k.series():
                 stats["rows"] += db.upsert_series(c, page)
             c.commit()
 
-        # closed/settled events are polled by update time: from the last run's watermark
-        # (10 min overlap) or 3 days back on the first run; the watermark advances afterwards.
-        started = _now()
-        st = db.get_state(c, "events_updated")
-        since = (st["watermark"] - timedelta(minutes=10)) if st["watermark"] else started - timedelta(days=3)
+        seen: set[str] = set()
         with _stage("sync", "open events"):
-            stats["rows"] += _sync_events(k, c, status="open")
-        with _stage("sync", "closed events (updated)"):
-            stats["rows"] += _sync_events(k, c, status="closed", min_updated_ts=_epoch(since))
-        with _stage("sync", "settled events (updated)"):
-            stats["rows"] += _sync_events(k, c, status="settled", min_updated_ts=_epoch(since))
-        db.set_state(c, "events_updated", watermark=started)
-        c.commit()
+            stats["rows"] += _sync_events(k, c, seen, status="open")
 
         watch = db.watchlist(c)
         now = _now()
@@ -237,6 +280,8 @@ def sync(k: KalshiClient, c) -> None:
                     stats["rows"] += db.insert_trades(c, page)
                 db.set_state(c, job, watermark=now - timedelta(minutes=10))
             c.commit()
+        with _stage("sync", "stale sweep"):
+            stats["rows"] += stale_sweep(k, c, seen, sweep_max)
 
 
 # --------------------------------------------------------------------------- snapshot
@@ -258,14 +303,12 @@ def snapshot(k: KalshiClient, c, interval_min: int = 5) -> None:
 
 
 # --------------------------------------------------------------------------- reconcile
-def reconcile(k: KalshiClient, c) -> None:
-    """Nightly: lock in results for anything settled in the last 3 days, then daily candles
-    over each such market's full life; hourly too for markets in watchlisted series."""
+def reconcile(k: KalshiClient, c, sweep_max: int = SWEEP_MAX) -> None:
+    """Nightly: daily candles over the full life of each market settled in the last 3 days;
+    hourly too for markets in watchlisted series. Then the stale sweep, which locks in
+    status/result for markets that have closed or settled."""
     with db.run_log(c, "reconcile") as stats:
         since = _now() - timedelta(days=3)
-        with _stage("reconcile", "settled events (updated 3d)"):
-            stats["rows"] += _sync_events(k, c, status="settled", min_updated_ts=_epoch(since))
-
         rows = _market_rows(c, "settled_time >= %s AND ticker NOT LIKE %s", (since, "KXMVE%"))
         watched = {w["series_ticker"] for w in db.watchlist(c)}
         hourly = [m for m in rows if m["series_ticker"] in watched]
@@ -273,3 +316,5 @@ def reconcile(k: KalshiClient, c) -> None:
             with _stage("reconcile", f"{name} candles ({len(subset)} markets)"):
                 for (s, e), tickers in _life_windows(subset, period).items():
                     stats["rows"] += _batch_candles(k, c, tickers, period, s, e)
+        with _stage("reconcile", "stale sweep"):
+            stats["rows"] += stale_sweep(k, c, max_markets=sweep_max)
