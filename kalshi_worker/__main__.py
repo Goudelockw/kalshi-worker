@@ -1,8 +1,12 @@
 """CLI entry point.
 
   python -m kalshi_worker backfill     one-time daily-candle backfill (resumable)
-  python -m kalshi_worker sync         hourly refresh          (Railway cron)
-  python -m kalshi_worker reconcile    nightly settlement lock (Railway cron)
+  python -m kalshi_worker sync [--max N]        hourly refresh          (Railway cron)
+  python -m kalshi_worker reconcile [--max N]   nightly settlement lock (Railway cron)
+  python -m kalshi_worker sweep [--max N]       just the stale sweep: re-fetch non-final
+                                       markets via /markets?tickers=, least recently updated
+                                       first, up to N per run (default 20000; also caps the
+                                       sweep at the end of sync and reconcile)
   python -m kalshi_worker snapshot     one order-book snapshot pass
   python -m kalshi_worker transcripts [--limit N] [--discover-months N] [--reparse]
                                        discover new Fool transcript URLs from the monthly
@@ -46,9 +50,11 @@ def run(cmd: str, args: list[str] = ()) -> None:
         if cmd == "backfill":
             jobs.backfill(k, c)
         elif cmd == "sync":
-            jobs.sync(k, c)
+            jobs.sync(k, c, sweep_max=_opt("max", list(args)) or jobs.SWEEP_MAX)
         elif cmd == "reconcile":
-            jobs.reconcile(k, c)
+            jobs.reconcile(k, c, sweep_max=_opt("max", list(args)) or jobs.SWEEP_MAX)
+        elif cmd == "sweep":
+            jobs.sweep(k, c, max_markets=_opt("max", list(args)) or jobs.SWEEP_MAX)
         elif cmd == "snapshot":
             jobs.snapshot(k, c, int(os.getenv("SNAPSHOT_INTERVAL_MIN", "5")))
         elif cmd == "transcripts":
