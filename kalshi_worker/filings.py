@@ -1,9 +1,13 @@
 """SEC EDGAR 8-K earnings press releases (Item 2.02, Exhibit 99.1).
 
 For every company with an earnings-mention market: resolve its CIK from the SEC ticker file,
-list recent submissions, keep 8-Ks carrying Item 2.02 filed in the last N days, and store the
-Exhibit 99.1 text in kalshi.filings. Every request carries the descriptive User-Agent the SEC
-requires (KalshiWorker/1.0 with SEC_CONTACT_EMAIL) and is throttled to 8 requests/second.
+list its submissions, keep 8-Ks carrying Item 2.02 filed in the last N days, and store the
+Exhibit 99.1 text in kalshi.filings. Foreign filers report earnings on Form 6-K, which has no
+item numbers: a 6-K is kept when its Exhibit 99.1 (or primary document) announces results in
+its first 1,500 characters, and stored with form '6-K' and no items. A symbol without a
+filings_backfill:<SYMBOL> row in sync_state is looked at over the last three years once (older
+submissions pages included), then marked. Every request carries the descriptive User-Agent the
+SEC requires (KalshiWorker/1.0 with SEC_CONTACT_EMAIL) and is throttled to 8 requests/second.
 """
 from __future__ import annotations
 
@@ -27,6 +31,12 @@ ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc}/"
 DEFAULT_DAYS = 3
 RPS = 8.0
 EARNINGS_ITEM = "2.02"
+FOREIGN_FORM = "6-K"
+RESULTS_HEAD = 1500             # a 6-K counts as an earnings release when this much of it announces results
+RESULTS_RE = re.compile(r"(?:first|second|third|fourth|q[1-4]).{0,40}(?:quarter|results)"
+                        r"|results for the (?:quarter|three months|fiscal)", re.I | re.S)
+BACKFILL_DAYS = 3 * 365
+BACKFILL_STATE = "filings_backfill:"          # sync_state job per symbol whose 3-year backfill ran
 EVENT_FORMS = ("8-K", "8-K/A")
 EVENT_ITEMS = ("1.01", "1.02", "2.01", "2.05", "2.06", "5.02")   # agreements, M&A, restructuring, impairment, exec change
 
@@ -114,13 +124,37 @@ def cik_map(tickers_json: dict) -> dict[str, tuple[str, str]]:
     return out
 
 
-def recent_filings(submissions: dict) -> list[dict]:
-    """Flatten filings.recent (parallel arrays) into one dict per filing."""
-    rec = (submissions.get("filings") or {}).get("recent") or {}
+def _flatten(rec: dict) -> list[dict]:
+    """Parallel arrays (filings.recent, or an older submissions page) -> one dict per filing."""
     keys = ("accessionNumber", "filingDate", "reportDate", "acceptanceDateTime", "form", "items",
             "primaryDocument", "primaryDocDescription")
     n = len(rec.get("accessionNumber") or [])
     return [{k: (rec.get(k) or [None] * n)[i] for k in keys} for i in range(n)]
+
+
+def recent_filings(submissions: dict) -> list[dict]:
+    """Flatten filings.recent (parallel arrays) into one dict per filing."""
+    return _flatten((submissions.get("filings") or {}).get("recent") or {})
+
+
+def all_filings(edgar: "Edgar", submissions: dict, since: date) -> list[dict]:
+    """filings.recent plus, when it doesn't reach back to `since`, the older submissions pages
+    listed in filings.files (CIK##########-submissions-001.json, ...), newest first, until a
+    page starts before `since`."""
+    out = recent_filings(submissions)
+    dates = [f["filingDate"] for f in out if f.get("filingDate")]
+    if dates and min(dates) < since.isoformat():
+        return out
+    pages = sorted((submissions.get("filings") or {}).get("files") or [],
+                   key=lambda p: p.get("filingTo") or "", reverse=True)
+    for page in pages:
+        if (page.get("filingTo") or "9999") < since.isoformat():
+            break
+        data = edgar.json(SUBMISSIONS_URL.format(name=page["name"]))
+        out.extend(_flatten((data.get("filings") or {}).get("recent") or data))   # pages are bare arrays
+        if (page.get("filingFrom") or "") < since.isoformat():
+            break
+    return out
 
 
 def earnings_8ks(filings: list[dict], since: date) -> list[dict]:
@@ -134,6 +168,18 @@ def earnings_8ks(filings: list[dict], since: date) -> list[dict]:
             continue
         out.append({**f, "item_list": items})
     return out
+
+
+def foreign_6ks(filings: list[dict], since: date) -> list[dict]:
+    """6-Ks filed on or after `since` (no item numbers; whether one is an earnings release is
+    decided from its text, see is_results)."""
+    return [{**f, "item_list": []} for f in filings
+            if f.get("form") == FOREIGN_FORM and f.get("filingDate") and date.fromisoformat(f["filingDate"]) >= since]
+
+
+def is_results(text: str) -> bool:
+    """True when the first RESULTS_HEAD characters announce quarterly / fiscal results."""
+    return bool(RESULTS_RE.search((text or "")[:RESULTS_HEAD]))
 
 
 def event_8ks(filings: list[dict], since: date) -> list[dict]:
@@ -285,12 +331,12 @@ def _upsert_event(c, row: dict) -> None:
                          fetched_at = now()""", row)
 
 
-def _store_events(edgar: "Edgar", c, symbol: str, cik: str, subs: dict, since: date,
+def _store_events(edgar: "Edgar", c, symbol: str, cik: str, filings: list[dict], since: date,
                   counts: "Counter[str]") -> tuple[int, int, int]:
     """Corporate-event 8-Ks for one company: returns (candidates, stored, failed); `counts` gets
     one tick per stored filing for each EVENT_ITEMS code it carries."""
     known = _known_events(c, symbol)
-    todo = [f for f in event_8ks(recent_filings(subs), since) if f["accessionNumber"] not in known]
+    todo = [f for f in event_8ks(filings, since) if f["accessionNumber"] not in known]
     stored = failed = 0
     for f in todo:
         acc = f["accessionNumber"]
@@ -321,6 +367,14 @@ def _known_accessions(c, symbol: str) -> set[str]:
     with c.cursor() as cur:
         cur.execute("SELECT accession FROM filings WHERE symbol = %s", (symbol,))
         return {r[0] for r in cur.fetchall()}
+
+
+def _uncovered(c, symbols: list[str]) -> list[str]:
+    """Tracked symbols with no stored filings."""
+    with c.cursor() as cur:
+        cur.execute("""SELECT s.sym FROM unnest(%s::text[]) s(sym)
+                       WHERE NOT EXISTS (SELECT 1 FROM filings f WHERE f.symbol = s.sym) ORDER BY 1""", (symbols,))
+        return [r[0] for r in cur.fetchall()]
 
 
 def _insert_filing(c, row: dict) -> int:
@@ -355,22 +409,33 @@ def run(c, days: int = DEFAULT_DAYS, edgar: Edgar | None = None) -> None:
         log.info("filings: %d/%d symbols resolved to a CIK%s", len(resolved), len(symbols),
                  f"; unresolved: {', '.join(unresolved)}" if unresolved else "")
 
-        # 3 + 4. submissions -> new 8-K 2.02 filings -> Exhibit 99.1 text
-        candidates = new = failed = 0
+        # 3 + 4. submissions -> new 8-K 2.02 / 6-K results filings -> Exhibit 99.1 text
+        done = db.states_with_prefix(c, BACKFILL_STATE)
+        backfill_since = date.today() - timedelta(days=BACKFILL_DAYS)
+        to_backfill = sorted(s for s in resolved if s not in done)
+        if to_backfill:
+            log.info("filings: backfilling %d symbols since %s: %s", len(to_backfill), backfill_since,
+                     ", ".join(to_backfill))
+        candidates = new = failed = not_results = 0
         ev_candidates = ev_stored = ev_failed = 0
         ev_counts: Counter[str] = Counter()
         for i, (symbol, (cik, _name)) in enumerate(sorted(resolved.items()), 1):  # noqa: F841
+            backfill = symbol not in done
+            sym_since = backfill_since if backfill else since
             try:
                 subs = edgar.json(SUBMISSIONS_URL.format(name=f"CIK{cik}.json"))
+                _update_sic(c, symbol, subs.get("sic"), subs.get("sicDescription"))
+                c.commit()
+                filings = all_filings(edgar, subs, sym_since)
             except Exception as e:  # noqa: BLE001
+                c.rollback()
                 failed += 1
                 log.warning("filings: %s submissions failed: %s", symbol, e)
                 continue
-            _update_sic(c, symbol, subs.get("sic"), subs.get("sicDescription"))
-            c.commit()
             known = _known_accessions(c, symbol)
-            todo = [f for f in earnings_8ks(recent_filings(subs), since) if f["accessionNumber"] not in known]
-            candidates += len(todo)
+            todo = [f for f in earnings_8ks(filings, sym_since) + foreign_6ks(filings, sym_since)
+                    if f["accessionNumber"] not in known]
+            n_new = n_failed = n_skipped = 0
             for f in todo:
                 acc = f["accessionNumber"]
                 try:
@@ -380,35 +445,62 @@ def run(c, days: int = DEFAULT_DAYS, edgar: Edgar | None = None) -> None:
                         raise ValueError("no exhibit or primary document in archive index")
                     exhibit_url = folder + doc
                     text = html_to_text(edgar.text(exhibit_url))
+                    if f["form"] == FOREIGN_FORM and not is_results(text):
+                        n_skipped += 1
+                        continue
                     body, boilerplate = split_boilerplate(text, _name)
                     filed_at = _parse_ts(f.get("acceptanceDateTime")) or _parse_ts(f.get("filingDate"))
                     if not filed_at:
                         raise ValueError(f"no usable acceptanceDateTime/filingDate ({f.get('filingDate')!r})")
-                    new += _insert_filing(c, {
+                    n_new += _insert_filing(c, {
                         "accession": acc, "cik": cik, "symbol": symbol, "form": f["form"], "items": f["item_list"],
                         "filed_at": filed_at, "period": _parse_date(f.get("reportDate")), "exhibit_url": exhibit_url,
                         "raw_text": text, "word_count": len(text.split()),
                         "body_text": body, "boilerplate_text": boilerplate})
                     c.commit()
                     stats["rows"] += 1
-                    log.info("filings: %s %s filed %s -> %s (%d words)", symbol, acc, f["filingDate"], doc, len(text.split()))
+                    log.info("filings: %s %s %s filed %s -> %s (%d words)", symbol, f["form"], acc, f["filingDate"],
+                             doc, len(text.split()))
                 except Exception as e:  # noqa: BLE001
                     c.rollback()
-                    failed += 1
+                    n_failed += 1
                     log.warning("filings: %s %s failed: %s", symbol, acc, e)
-            n_cand, n_stored, n_failed = _store_events(edgar, c, symbol, cik, subs, since, ev_counts)
-            ev_candidates, ev_stored, ev_failed = ev_candidates + n_cand, ev_stored + n_stored, ev_failed + n_failed
+            candidates += len(todo) - n_skipped
+            new, failed, not_results = new + n_new, failed + n_failed, not_results + n_skipped
+            n_cand, n_stored, n_ev_failed = _store_events(edgar, c, symbol, cik, filings, sym_since, ev_counts)
+            ev_candidates, ev_stored, ev_failed = ev_candidates + n_cand, ev_stored + n_stored, ev_failed + n_ev_failed
             stats["rows"] += n_stored
+            if backfill:
+                db.set_state(c, BACKFILL_STATE + symbol, meta={
+                    "since": sym_since.isoformat(), "filings_scanned": len(filings), "earnings_stored": n_new,
+                    "earnings_failed": n_failed, "sixk_not_results": n_skipped, "events_stored": n_stored,
+                    "events_failed": n_ev_failed})
+                c.commit()
+                log.info("filings: %s backfilled since %s: %d submissions scanned, %d earnings releases stored "
+                         "(%d failed, %d 6-Ks not results), %d corporate events stored (%d failed)", symbol,
+                         sym_since, len(filings), n_new, n_failed, n_skipped, n_stored, n_ev_failed)
             if i % 25 == 0 or i == len(resolved):
                 log.info("filings: %d/%d symbols done; %d candidate filings, %d stored, %d failed; "
                          "%d corporate events stored, %d failed", i, len(resolved), candidates, new, failed,
                          ev_stored, ev_failed)
-        log.info("filings: done (last %d days): %d symbols, %d resolved, %d new 8-K 2.02 candidates, %d stored, %d failed",
-                 days, len(symbols), len(resolved), candidates, new, failed)
-        log.info("filings: corporate events (last %d days): %d new candidates, %d stored, %d failed; by item: %s",
-                 days, ev_candidates, ev_stored, ev_failed,
+        log.info("filings: done (last %d days; %d symbols backfilled over %d days): %d symbols, %d resolved, "
+                 "%d new 8-K 2.02 / 6-K results candidates, %d stored, %d failed, %d 6-Ks skipped as not results",
+                 days, len(to_backfill), BACKFILL_DAYS, len(symbols), len(resolved), candidates, new, failed,
+                 not_results)
+        log.info("filings: corporate events: %d new candidates, %d stored, %d failed; by item: %s",
+                 ev_candidates, ev_stored, ev_failed,
                  ", ".join(f"{item}={ev_counts.get(item, 0)}" for item in EVENT_ITEMS))
+        uncovered = _uncovered(c, symbols)
+        log.info("filings: coverage: %d tracked symbols with 0 filings%s", len(uncovered),
+                 f": {', '.join(uncovered)}" if uncovered else "")
+    db.refresh_word_counts(c)
 
+
+def reset_backfill(c, symbol: str) -> None:
+    """Delete the symbol's filings_backfill row so the next run looks back three years for it."""
+    n = db.delete_state(c, BACKFILL_STATE + symbol)
+    c.commit()
+    log.info("filings: %s backfill marker %s", symbol, "cleared" if n else "was not set")
 
 
 def reparse(c) -> None:

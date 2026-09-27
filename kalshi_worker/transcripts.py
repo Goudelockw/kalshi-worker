@@ -24,6 +24,8 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 REQUEST_DELAY_S = 1.0
 SITEMAP_URL = "https://www.fool.com/sitemap/{year}/{month:02d}"
 DISCOVER_MONTHS = 2
+BACKFILL_MONTHS = 36
+BACKFILL_STATE = "transcripts_backfill:"        # sync_state job per symbol whose 36-month backfill ran
 LOC_RE = re.compile(r"<loc>\s*(.*?)\s*</loc>", re.S | re.I)
 TRANSCRIPT_PATH_RE = re.compile(r"/earnings/call-transcripts/(\d{4})/(\d{2})/(\d{2})/")
 SLUG_RE = re.compile(r"-([a-z0-9.]+)-q([1-4])-(\d{4})-")
@@ -357,21 +359,35 @@ def parse_sitemap(xml: str, symbols: dict[str, str]) -> list[dict]:
 
 def discover(http: httpx.Client, c, months: int = DISCOVER_MONTHS) -> int:
     """Queue transcript URLs for companies with earnings-mention markets from the Fool monthly
-    sitemaps (current month and the months-1 before it). Returns the number of new rows."""
+    sitemaps: the current month and the months-1 before it for every symbol, and, when some
+    symbols have never been backfilled (no transcripts_backfill:<SYMBOL> row in sync_state), the
+    older sitemaps back to BACKFILL_MONTHS matched against those symbols only, in the same single
+    pass. Each backfilled symbol then gets its sync_state row (meta: matched / queued counts),
+    even when nothing matched. Returns the number of new rows."""
     symbols = _mention_symbols(c)
     if not symbols:
         log.info("transcripts: discover skipped, no KXEARNINGSMENTION series in markets")
         return 0
+    done = db.states_with_prefix(c, BACKFILL_STATE)
+    new_syms = {n: s for n, s in symbols.items() if s not in done}
+    scan = max(months, BACKFILL_MONTHS) if new_syms else months
+    if new_syms:
+        log.info("transcripts: backfilling %d new symbols over %d months: %s", len(new_syms), BACKFILL_MONTHS,
+                 ", ".join(sorted(new_syms.values())))
     found: list[dict] = []
-    for i, (y, m) in enumerate(_months(date.today(), months)):
+    failed_maps: list[str] = []
+    for i, (y, m) in enumerate(_months(date.today(), scan)):
         if i:
             time.sleep(REQUEST_DELAY_S)
         url = SITEMAP_URL.format(year=y, month=m)
         try:
-            found.extend(parse_sitemap(fetch(http, url), symbols))
+            found.extend(parse_sitemap(fetch(http, url), symbols if i < months else new_syms))
         except Exception as e:  # noqa: BLE001
+            failed_maps.append(f"{y}-{m:02d}")
             log.warning("transcripts: sitemap %s failed: %s", url, e)
     new = 0
+    matched: dict[str, int] = {}
+    queued: dict[str, int] = {}
     with c.cursor() as cur:
         for r in found:
             cur.execute("""INSERT INTO transcript_sources (symbol, source, url, fiscal_year, fiscal_quarter,
@@ -380,9 +396,18 @@ def discover(http: httpx.Client, c, months: int = DISCOVER_MONTHS) -> int:
                         (r["symbol"], r["url"], r["fiscal_year"], r["fiscal_quarter"], r["published_date"],
                          r["published_date"]))
             new += cur.rowcount
+            matched[r["symbol"]] = matched.get(r["symbol"], 0) + 1
+            queued[r["symbol"]] = queued.get(r["symbol"], 0) + cur.rowcount
+    for sym in new_syms.values():
+        db.set_state(c, BACKFILL_STATE + sym, meta={"months": BACKFILL_MONTHS, "matched": matched.get(sym, 0),
+                                                    "queued": queued.get(sym, 0), "failed_sitemaps": failed_maps})
     c.commit()
     log.info("transcripts: discover queued %d new URLs (%d matched %d tracked symbols across %d sitemaps)",
-             new, len(found), len(symbols), months)
+             new, len(found), len(symbols), scan)
+    if new_syms:
+        log.info("transcripts: backfill matches: %s%s",
+                 ", ".join(f"{s}={matched.get(s, 0)}" for s in sorted(new_syms.values())),
+                 f"; failed sitemaps: {', '.join(failed_maps)}" if failed_maps else "")
     return new
 
 
@@ -457,6 +482,15 @@ def _stale(c, limit: int | None, ratio: float) -> list[dict]:
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
+def _uncovered(c) -> list[str]:
+    """Tracked symbols with no stored transcripts."""
+    with c.cursor() as cur:
+        cur.execute("""SELECT s.sym FROM unnest(%s::text[]) s(sym)
+                       WHERE NOT EXISTS (SELECT 1 FROM transcripts t WHERE t.symbol = s.sym) ORDER BY 1""",
+                    (sorted(set(_mention_symbols(c).values())),))
+        return [r[0] for r in cur.fetchall()]
+
+
 def _fail(c, url: str, fetched: bool, err: str) -> None:
     c.rollback()
     with c.cursor() as cur:
@@ -505,8 +539,18 @@ def run(c, limit: int | None = None, discover_months: int = DISCOVER_MONTHS) -> 
             if i % 25 == 0 or i == len(queue):
                 log.info("transcripts: %d/%d done (%d parsed, %d failed) in %.0fs",
                          i, len(queue), ok, failed, time.monotonic() - t0)
+        uncovered = _uncovered(c)
+        log.info("transcripts: coverage: %d tracked symbols with 0 transcripts%s", len(uncovered),
+                 f": {', '.join(uncovered)}" if uncovered else "")
     http.close()
+    db.refresh_word_counts(c)
 
+
+def reset_backfill(c, symbol: str) -> None:
+    """Delete the symbol's transcripts_backfill row so the next discover re-scans 36 months for it."""
+    n = db.delete_state(c, BACKFILL_STATE + symbol)
+    c.commit()
+    log.info("transcripts: %s backfill marker %s", symbol, "cleared" if n else "was not set")
 
 
 
