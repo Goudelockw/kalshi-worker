@@ -1,6 +1,6 @@
 """Motley Fool earnings-call transcript ingestion.
 
-Works the kalshi.transcript_sources queue (status='pending', newest call first): fetch the
+Works the kalshi.transcript_sources queue (source='fool', status='pending', newest call first): fetch the
 page with a browser User-Agent, keep the HTML, split it into speaking turns, tag each turn
 with a section (prepared / qa) and a speaker role (operator / exec / analyst / unknown), and
 write one transcripts row plus its transcript_segments. One second between requests.
@@ -415,7 +415,7 @@ def discover(http: httpx.Client, c, months: int = DISCOVER_MONTHS) -> int:
 def _pending(c, limit: int | None) -> list[dict]:
     sql = """SELECT url, symbol, source, fiscal_year, fiscal_quarter, call_date,
                     coalesce(published_date, call_date) AS published_date
-             FROM transcript_sources WHERE status = 'pending'
+             FROM transcript_sources WHERE status = 'pending' AND source = 'fool'
              ORDER BY call_date DESC NULLS LAST, url"""
     params: tuple = ()
     if limit:
@@ -467,7 +467,7 @@ def _stale(c, limit: int | None, ratio: float) -> list[dict]:
              FROM transcripts t
              LEFT JOIN transcript_sources ts ON ts.url = t.source_url
              LEFT JOIN transcript_segments s ON s.transcript_id = t.id
-             WHERE t.raw_html IS NOT NULL
+             WHERE t.raw_html IS NOT NULL AND t.source = 'fool'
              GROUP BY t.id, ts.call_date
              HAVING coalesce(sum(s.word_count), 0) < %s * coalesce(t.word_count, 0)
                  OR t.published_date IS NULL
@@ -539,10 +539,16 @@ def run(c, limit: int | None = None, discover_months: int = DISCOVER_MONTHS) -> 
             if i % 25 == 0 or i == len(queue):
                 log.info("transcripts: %d/%d done (%d parsed, %d failed) in %.0fs",
                          i, len(queue), ok, failed, time.monotonic() - t0)
-        uncovered = _uncovered(c)
-        log.info("transcripts: coverage: %d tracked symbols with 0 transcripts%s", len(uncovered),
-                 f": {', '.join(uncovered)}" if uncovered else "")
     http.close()
+    from . import fortune   # imports this module; deferred to avoid a cycle
+    try:
+        fortune.run(c, refresh=False)
+    except Exception as e:  # noqa: BLE001
+        c.rollback()
+        log.warning("transcripts: fortune step failed: %s", e)
+    uncovered = _uncovered(c)
+    log.info("transcripts: coverage: %d tracked symbols with 0 transcripts%s", len(uncovered),
+             f": {', '.join(uncovered)}" if uncovered else "")
     db.refresh_word_counts(c)
 
 
