@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 from contextlib import contextmanager
@@ -13,6 +14,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 DATABASE_URL = os.environ["DATABASE_URL"]
+log = logging.getLogger(__name__)
 
 
 def _ipv4_hostaddr(url: str) -> str | None:
@@ -205,6 +207,32 @@ def set_state(c, job: str, cursor: str | None = None, watermark: datetime | None
                        ON CONFLICT (job) DO UPDATE SET cursor=EXCLUDED.cursor, watermark=EXCLUDED.watermark,
                          meta=COALESCE(EXCLUDED.meta, sync_state.meta), updated_at=now()""",
                     (job, cursor, watermark, Jsonb(meta) if meta is not None else None))
+
+
+def states_with_prefix(c, prefix: str) -> set[str]:
+    """The part after `prefix` of every sync_state job that starts with it."""
+    with c.cursor() as cur:
+        cur.execute("SELECT job FROM sync_state WHERE starts_with(job, %s)", (prefix,))
+        return {r[0][len(prefix):] for r in cur.fetchall()}
+
+
+def delete_state(c, job: str) -> int:
+    with c.cursor() as cur:
+        cur.execute("DELETE FROM sync_state WHERE job = %s", (job,))
+        return cur.rowcount
+
+
+def refresh_word_counts(c) -> None:
+    """REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_counts; a failure is logged, not raised."""
+    try:
+        c.commit()
+        with c.cursor() as cur:
+            cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_counts")
+        c.commit()
+        log.info("refreshed kalshi.mv_word_counts")
+    except Exception as e:  # noqa: BLE001
+        c.rollback()
+        log.warning("refresh of kalshi.mv_word_counts failed: %s", e)
 
 
 def watchlist(c) -> list[dict]:

@@ -8,14 +8,19 @@
                                        first, up to N per run (default 20000; also caps the
                                        sweep at the end of sync and reconcile)
   python -m kalshi_worker snapshot     one order-book snapshot pass
-  python -m kalshi_worker transcripts [--limit N] [--discover-months N] [--reparse]
+  python -m kalshi_worker transcripts [--limit N] [--discover-months N] [--reparse] [--backfill-symbol SYM]
                                        discover new Fool transcript URLs from the monthly
-                                       sitemaps (default 2 months), then parse pending rows;
-                                       --reparse re-parses stored HTML instead
-  python -m kalshi_worker filings [--days N] [--reparse]   8-K earnings press releases
-                                       (Item 2.02 / Exhibit 99.1) from SEC EDGAR, last N days
-                                       (default 3; 1100 for the backfill); --reparse only
-                                       splits body/boilerplate for stored rows lacking it
+                                       sitemaps (default 2 months; 36 for symbols never
+                                       backfilled), then parse pending rows; --reparse re-parses
+                                       stored HTML instead; --backfill-symbol clears SYM's
+                                       backfill marker first so this run re-scans 36 months for it
+  python -m kalshi_worker filings [--days N] [--reparse] [--backfill-symbol SYM]
+                                       8-K earnings press releases (Item 2.02 / Exhibit 99.1)
+                                       and 6-K results releases from SEC EDGAR, last N days
+                                       (default 3; three years for symbols never backfilled);
+                                       --reparse only splits body/boilerplate for stored rows
+                                       lacking it; --backfill-symbol clears SYM's backfill marker
+                                       first so this run looks back three years for it
   python -m kalshi_worker reactions [--days N]   1-minute candles around earnings press
                                        releases for mention markets (default 3; 90 for backfill)
   python -m kalshi_worker worker       always-on: snapshot every N minutes
@@ -44,6 +49,16 @@ def _opt(name: str, args: list[str]) -> int | None:
     return None
 
 
+def _sopt(name: str, args: list[str]) -> str | None:
+    """--name VALUE or --name=VALUE from the remaining argv, as a string."""
+    for i, a in enumerate(args):
+        if a == f"--{name}" and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith(f"--{name}="):
+            return a.split("=", 1)[1]
+    return None
+
+
 def run(cmd: str, args: list[str] = ()) -> None:
     k = KalshiClient()
     with db.conn() as c:
@@ -61,12 +76,16 @@ def run(cmd: str, args: list[str] = ()) -> None:
             if "--reparse" in args:
                 transcripts.reparse(c, limit=_opt("limit", list(args)))
             else:
+                if sym := _sopt("backfill-symbol", list(args)):
+                    transcripts.reset_backfill(c, sym.upper())
                 transcripts.run(c, limit=_opt("limit", list(args)),
                                 discover_months=_opt("discover-months", list(args)) or transcripts.DISCOVER_MONTHS)
         elif cmd == "filings":
             if "--reparse" in args:
                 filings.reparse(c)
             else:
+                if sym := _sopt("backfill-symbol", list(args)):
+                    filings.reset_backfill(c, sym.upper())
                 filings.run(c, days=_opt("days", list(args)) or filings.DEFAULT_DAYS)
         elif cmd == "reactions":
             reactions.run(k, c, days=_opt("days", list(args)) or reactions.DEFAULT_DAYS)
