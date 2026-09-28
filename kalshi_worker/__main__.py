@@ -30,6 +30,9 @@
   python -m kalshi_worker precall [--limit N]   hourly candles from 48h before to 1h after each
                                        settled earnings-mention call (newest events first;
                                        --limit caps events); reconcile runs it for the last 3 days
+  python -m kalshi_worker mentions-backfill   one-off: every KXEARNINGSMENTION series, its events and
+                                       settled markets (archive + live tier), then precall for
+                                       settled markets without hourly windows; resumable per series
   python -m kalshi_worker reactions [--days N]   1-minute candles around earnings press
                                        releases for mention markets (default 3; 90 for backfill)
   python -m kalshi_worker worker       always-on: snapshot every N minutes
@@ -44,7 +47,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("kalshi_worker")
 
-from . import db, equibles, filings, fortune, jobs, precall, reactions, transcripts  # noqa: E402  (after load_dotenv so DATABASE_URL is present)
+from . import db, equibles, filings, fortune, jobs, mentions, precall, reactions, transcripts  # noqa: E402  (after load_dotenv so DATABASE_URL is present)
 from .client import KalshiClient  # noqa: E402
 
 
@@ -101,6 +104,8 @@ def run(cmd: str, args: list[str] = ()) -> None:
             fortune.run(c, symbol=sym.upper() if sym else None, limit=_opt("limit", list(args)))
         elif cmd == "equibles":
             equibles.run(c, limit=_opt("limit", list(args)))
+        elif cmd == "mentions-backfill":
+            mentions.run(k, c)
         elif cmd == "precall":
             precall.run(k, c, limit=_opt("limit", list(args)))
         elif cmd == "reactions":
