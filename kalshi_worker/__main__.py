@@ -25,7 +25,7 @@
                                        find missing company slugs, then store new / pending
                                        calls (also runs at the end of `transcripts`)
   python -m kalshi_worker equibles [--limit N]   Equibles transcripts for calls no other source has
-                                       (kalshi.v_transcript_gaps), at most 80 API requests per run;
+                                       (kalshi.v_transcript_gaps), at most 90 API requests per run;
                                        needs EQUIBLES_API_KEY (also runs at the end of `transcripts`)
   python -m kalshi_worker reactions [--days N]   1-minute candles around earnings press
                                        releases for mention markets (default 3; 90 for backfill)

@@ -1,20 +1,21 @@
 """Equibles earnings-call transcripts: a third source, only for calls nobody else has.
 
-Works kalshi.v_transcript_gaps (mention events the label audit found no transcript for, and
-recent earnings releases with no transcript within 3 days), newest first, skipping gaps tried
-in the last 7 days (kalshi.equibles_attempts). For each gap: list the ticker's earnings calls,
-take the one nearest the target date, fetch
-/v1/stocks/{ticker}/earnings-calls/{fiscalYear}/{fiscalQuarter} (the company's own fiscal
-labels) and store it like the Fortune path: transcript_sources + transcripts (source
-'equibles', raw_html = the JSON response) + one transcript_segments row per speaker turn.
+Works kalshi.v_transcript_gaps (settled Kalshi calls the label audit found no transcript for
+first, then recent earnings releases with no transcript within 3 days, newest first), skipping
+gaps tried in the last 7 days (kalshi.equibles_attempts). For each gap:
 
-The free tier allows 100 requests a day: each run makes at most MAX_REQUESTS and stops
-cleanly on HTTP 429. Needs EQUIBLES_API_KEY.
+1. GET /v1/stocks/{T}/investor-events (once per symbol per run) and take the EarningsCall
+   event with hasTranscript whose callDate is nearest the target date, within 5 days.
+2. GET /v1/stocks/{T}/earnings-calls/{fiscalYear}/{fiscalQuarter}/speakers?offset=N, 50 turns
+   a page, while hasMore.
+3. Store it like the Fortune path: transcript_sources + transcripts (source 'equibles',
+   raw_html = all pages' turns as JSON) + one transcript_segments row per turn.
 
-The response parsing below is deliberately tolerant about field names (camelCase or
-snake_case, list wrapped in data/items/results or bare); a response it can't read at all
-raises ShapeError, which stops the run without recording an attempt, so fixing the parser
-doesn't cost a 7-day wait.
+The free tier allows 100 requests a day: every request (listings and pages) counts against a
+per-run budget of MAX_REQUESTS, and the run stops cleanly on the budget or HTTP 429 without
+storing a partial transcript or recording an attempt for that gap. A response without the
+expected "data" list raises ShapeError, which stops the run the same way. Needs
+EQUIBLES_API_KEY.
 """
 from __future__ import annotations
 
@@ -23,23 +24,26 @@ import logging
 import os
 import re
 import time
-from datetime import date, datetime
+from datetime import date
 
 import httpx
 
 from . import db
-from .transcripts import _write_segments
+from .transcripts import ANALYST_WORDS, _write_segments
 
 log = logging.getLogger(__name__)
 
 BASE_URL = "https://api.equibles.com/v1"
-LIST_PATH = "/stocks/{ticker}/earnings-calls"
-CALL_PATH = "/stocks/{ticker}/earnings-calls/{fy}/{fq}"
-MAX_REQUESTS = 80                # free tier: 100 requests/day
+EVENTS_PATH = "/stocks/{ticker}/investor-events"
+SPEAKERS_PATH = "/stocks/{ticker}/earnings-calls/{fy}/{fq}/speakers"
+SOURCE_URL = "https://equibles.com/stocks/{ticker}/calls/{fy}-q{fq}"
+MAX_REQUESTS = 90                # free tier: 100 requests/day
 RETRY_DAYS = 7
-MATCH_DAYS = 10                  # nearest listed call must be this close to the gap's target date
-CORPORATE_WORDS = {"the", "inc", "corp", "corporation", "co", "company", "ltd", "plc", "nv", "sa", "holdings",
-                   "group", "technologies", "llc"}
+MATCH_DAYS = 5                   # the event's callDate must be this close to the gap's target date
+MAX_PAGES = 40                   # safety stop for hasMore (40 x 50 turns)
+ANALYST_ROLE_RE = re.compile(r"analyst|research|equity", re.I)
+EXEC_ROLE_RE = re.compile(r"\b(?:chief|officer|president|ceo|cfo|coo|cto|vp|head|director|chair|chairman|chairwoman|"
+                          r"founder|treasurer|controller|secretary|counsel|investor relations|executive)\b", re.I)
 
 
 class QuotaExhausted(Exception):
@@ -47,7 +51,7 @@ class QuotaExhausted(Exception):
 
 
 class ShapeError(Exception):
-    """The response doesn't look like anything the parser knows."""
+    """A response without the expected "data" list."""
 
 
 # ------------------------------------------------------------------------------ http
@@ -57,7 +61,7 @@ class Equibles:
             "Authorization": f"Bearer {api_key}", "Accept": "application/json"})
         self.budget, self.used = budget, 0
 
-    def get(self, path: str) -> dict | list | None:
+    def get(self, path: str, params: dict | None = None) -> dict | None:
         """GET one API path; None on 404. Every attempt counts against the budget; one retry on
         5xx / transport errors; 429 raises QuotaExhausted."""
         for attempt in range(2):
@@ -65,7 +69,7 @@ class Equibles:
                 raise QuotaExhausted(f"request budget of {self.budget} used")
             self.used += 1
             try:
-                r = self.http.get(path)
+                r = self.http.get(path, params=params)
             except httpx.TransportError as e:
                 if attempt:
                     raise
@@ -88,155 +92,105 @@ class Equibles:
         self.http.close()
 
 
-# ---------------------------------------------------------------------------- parse
-def _pick(d: dict, *keys: str):
-    for k in keys:
-        if k in d and d[k] not in (None, ""):
-            return d[k]
-    return None
-
-
-def _as_list(payload, *keys: str) -> list | None:
-    """The list inside a response: the payload itself, or under data/items/results/`keys`
-    (one level of nesting, e.g. {"data": {"items": [...]}})."""
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        for k in (*keys, "data", "items", "results"):
-            v = payload.get(k)
-            if isinstance(v, list):
-                return v
-            if isinstance(v, dict):
-                inner = _as_list(v, *keys)
-                if inner is not None:
-                    return inner
-    return None
+def _data(payload, what: str) -> list:
+    items = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        keys = sorted(payload)[:15] if isinstance(payload, dict) else type(payload).__name__
+        raise ShapeError(f"{what}: no 'data' list (keys: {keys})")
+    return items
 
 
 def _date(value) -> date | None:
-    if not value:
-        return None
-    s = str(value)
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).date() if "T" in s else date.fromisoformat(s[:10])
+        return date.fromisoformat(str(value)[:10]) if value else None
     except ValueError:
         return None
 
 
-def call_ref(item: dict) -> dict | None:
-    """One listed earnings call -> {"fy", "fq", "date"}; None when a field is missing."""
-    fy = _pick(item, "fiscalYear", "fiscal_year", "year")
-    fq = _pick(item, "fiscalQuarter", "fiscal_quarter", "quarter")
-    d = _date(_pick(item, "eventDate", "event_date", "date", "callDate", "call_date", "startDate", "start_date",
-                    "dateTime", "datetime", "reportDate", "report_date"))
-    if fq is not None:
-        m = re.search(r"\d", str(fq))
-        fq = int(m.group(0)) if m else None
-    try:
-        fy = int(fy) if fy is not None else None
-    except (TypeError, ValueError):
-        fy = None
-    return {"fy": fy, "fq": fq, "date": d} if fy and fq and d else None
-
-
-def nearest_call(listing, target: date) -> dict | None:
-    """The listed call nearest `target` within MATCH_DAYS. ShapeError when nothing in the
-    listing can be read as a call."""
-    items = _as_list(listing, "earningsCalls", "earnings_calls", "events", "calls")
-    if items is None:
-        raise ShapeError(f"no list in earnings-call listing (keys: {sorted(listing)[:12] if isinstance(listing, dict) else type(listing).__name__})")
-    refs = [r for r in (call_ref(i) for i in items if isinstance(i, dict)) if r]
-    if items and not refs:
-        raise ShapeError(f"no fiscal year/quarter/date in listed calls (first item keys: {sorted(items[0])[:15]})")
-    near = [r for r in refs if abs((r["date"] - target).days) <= MATCH_DAYS]
-    return min(near, key=lambda r: abs((r["date"] - target).days)) if near else None
-
-
-def _core(name: str | None) -> set[str]:
-    """Significant lower-case words of a company name ('The Walt Disney Company' -> {walt, disney})."""
-    return {w for w in re.sub(r"[^a-z0-9\s]", " ", (name or "").lower()).split() if w not in CORPORATE_WORDS}
-
-
-def parse_call(payload: dict, issuer: str | None) -> dict:
-    """Transcript response -> {"call_date", "turns", "raw_text"}. Turns: speaker = name (or
-    "Speaker N" when unverified), speaker_title = role - company; role operator / analyst (role
-    or company says analyst, or a company other than the issuer) / unknown (unverified) / exec;
-    section prepared until the first analyst turn, then qa. Consecutive entries from one speaker
-    merge."""
-    body = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-    entries = _as_list(body, "transcript", "segments", "paragraphs", "turns", "speakers", "content")
-    if entries is None and isinstance(body.get("transcript"), dict):
-        entries = _as_list(body["transcript"], "segments", "paragraphs", "turns", "speakers", "content")
-    if not entries:
-        raise ShapeError(f"no speaker turns in transcript response (keys: {sorted(body)[:15]})")
-    issuer_core = _core(issuer)
-    turns: list[dict] = []
-    in_qa = False
-    for e in entries:
-        if not isinstance(e, dict):
+# ---------------------------------------------------------------------------- parse
+def nearest_call(events: list[dict], target: date) -> dict | None:
+    """The EarningsCall event with a transcript whose callDate is nearest `target`, within
+    MATCH_DAYS -> {"fy", "fq", "date"}; None when there is none."""
+    best = None
+    for e in events:
+        if not isinstance(e, dict) or e.get("eventType") != "EarningsCall" or e.get("hasTranscript") is not True:
             continue
-        text = _pick(e, "text", "content", "speech", "paragraph", "body")
-        if isinstance(text, list):
-            text = " ".join(str(x.get("text", x)) if isinstance(x, dict) else str(x) for x in text)
-        text = (text or "").strip()
+        d, fy, fq = _date(e.get("callDate")), e.get("fiscalYear"), e.get("fiscalQuarter")
+        if not d or fy is None or fq is None or abs((d - target).days) > MATCH_DAYS:
+            continue
+        if best is None or abs((d - target).days) < abs((best["date"] - target).days):
+            best = {"fy": int(fy), "fq": int(fq), "date": d}
+    return best
+
+
+def _names_firm(role: str) -> bool:
+    """A speakerRole that is a firm (a bank / broker name) rather than an executive title."""
+    low = role.lower()
+    return any(w in low for w in ANALYST_WORDS) and not EXEC_ROLE_RE.search(role)
+
+
+def parse_turns(turns: list[dict]) -> dict:
+    """/speakers turns (all pages) -> {"turns", "raw_text"}, one turn per entry: speaker =
+    speakerName or "Speaker {speakerIndex}", speaker_title = speakerRole; role operator (role or
+    name says operator) / analyst (role says analyst, research or equity, or names a firm) /
+    unknown (no speakerName) / exec; section prepared until the first analyst turn, then qa."""
+    out: list[dict] = []
+    in_qa = False
+    for t in turns:
+        text = (t.get("text") or "").strip()
         if not text:
             continue
-        sp = e.get("speaker") if isinstance(e.get("speaker"), dict) else {}
-        src = {**e, **sp}
-        num = _pick(sp, "number", "id", "speakerNumber", "speakerId") if sp else None
-        if num is None:
-            num = _pick(e, "speakerNumber", "speaker_number", "speakerId", "speaker_id")
-        if num is None and isinstance(e.get("speaker"), int):
-            num = e["speaker"]
-        name = _pick(src, "speakerName", "speaker_name", "name")
-        if name is None and isinstance(e.get("speaker"), str):
-            name = e["speaker"]
-        verified = _pick(src, "verified", "isVerified", "is_verified", "speakerVerified")
-        unverified = verified is False or not name
-        role_raw = (_pick(src, "speakerRole", "speaker_role", "role", "title") or "").strip()
-        company = (_pick(src, "speakerCompany", "speaker_company", "company", "organization", "firm") or "").strip()
-        name = str(name).strip() if name and not unverified else f"Speaker {num if num is not None else '?'}"
-        low = f"{role_raw} {company}".lower()
-        if "operator" in name.lower() or "operator" in role_raw.lower():
+        name = (t.get("speakerName") or "").strip()
+        role_raw = (t.get("speakerRole") or "").strip()
+        if "operator" in role_raw.lower() or "operator" in name.lower():
             role = "operator"
-        elif "analyst" in low or (company and issuer_core and not (_core(company) & issuer_core)):
+        elif ANALYST_ROLE_RE.search(role_raw) or (role_raw and _names_firm(role_raw)):
             role = "analyst"
-        elif unverified:
+        elif not name:
             role = "unknown"
         else:
             role = "exec"
         in_qa = in_qa or role == "analyst"
-        section = "qa" if in_qa else "prepared"
-        title = " - ".join(x for x in (role_raw, company) if x) or None
-        prev = turns[-1] if turns else None
-        if prev and prev["speaker"] == name and prev["section"] == section:
-            prev["text"] = f"{prev['text']} {text}"
-            continue
-        turns.append({"speaker": name, "speaker_title": title, "role": role, "section": section, "text": text})
-    if not turns:
-        raise ShapeError(f"no text in transcript entries (first entry keys: {sorted(entries[0])[:15] if isinstance(entries[0], dict) else '?'})")
-    call_date = _date(_pick(body, "eventDate", "event_date", "date", "callDate", "call_date", "startDate", "dateTime"))
-    return {"call_date": call_date, "turns": turns, "raw_text": "\n\n".join(t["text"] for t in turns)}
+        out.append({"speaker": name or f"Speaker {t.get('speakerIndex')}", "speaker_title": role_raw or None,
+                    "role": role, "section": "qa" if in_qa else "prepared", "text": text})
+    return {"turns": out, "raw_text": "\n\n".join(t["text"] for t in out)}
+
+
+def fetch_turns(eq: Equibles, symbol: str, fy: int, fq: int) -> tuple[dict | None, list[dict]]:
+    """All pages of a call's /speakers -> (first page's envelope, turns). (None, []) on 404.
+    QuotaExhausted propagates, so a call is either fetched whole or not at all."""
+    path = SPEAKERS_PATH.format(ticker=symbol, fy=fy, fq=fq)
+    head, turns, offset = None, [], 0
+    for _ in range(MAX_PAGES):
+        page = eq.get(path, {"offset": offset})
+        if page is None:
+            return None, []
+        items = _data(page, f"{symbol} FY{fy} Q{fq} speakers")
+        head = head or page
+        turns.extend(items)
+        if not page.get("hasMore") or not items:
+            break
+        offset += len(items)
+    else:
+        log.warning("equibles: %s FY%d Q%d still hasMore after %d pages; keeping %d turns", symbol, fy, fq,
+                    MAX_PAGES, len(turns))
+    return head, turns
 
 
 # --------------------------------------------------------------------------------- db
 def _gaps(c) -> tuple[int, list[tuple[str, date]]]:
-    """(all gaps, gaps not tried in the last RETRY_DAYS, newest first)."""
+    """(all gaps, gaps not tried in the last RETRY_DAYS): settled Kalshi calls (label audit)
+    first, then newest first."""
     with c.cursor() as cur:
         cur.execute("""SELECT g.symbol, g.target_date,
                               EXISTS (SELECT 1 FROM equibles_attempts a
                                       WHERE a.symbol = g.symbol AND a.target_date = g.target_date
                                         AND a.tried_at > now() - %s * interval '1 day') AS recent
-                       FROM v_transcript_gaps g ORDER BY g.target_date DESC, g.symbol""", (RETRY_DAYS,))
+                       FROM v_transcript_gaps g
+                       ORDER BY (g.reasons LIKE '%%label_audit%%') DESC, g.target_date DESC, g.symbol""",
+                    (RETRY_DAYS,))
         rows = cur.fetchall()
     return len(rows), [(s, d) for s, d, recent in rows if not recent]
-
-
-def _issuer(c, symbol: str) -> str | None:
-    with c.cursor() as cur:
-        cur.execute("SELECT name FROM company_map WHERE symbol = %s", (symbol,))
-        row = cur.fetchone()
-    return row[0] if row else None
 
 
 def _have(c, symbol: str, fy: int, fq: int) -> bool:
@@ -253,7 +207,8 @@ def _attempt(c, symbol: str, target: date, ok: bool, note: str) -> None:
     c.commit()
 
 
-def _write(c, symbol: str, url: str, fy: int, fq: int, call_date: date | None, parsed: dict, payload) -> int:
+def _write(c, symbol: str, fy: int, fq: int, call_date: date | None, parsed: dict, turns: list[dict]) -> int:
+    url = SOURCE_URL.format(ticker=symbol.lower(), fy=fy, fq=fq)
     raw_text = parsed["raw_text"]
     with c.cursor() as cur:
         cur.execute("""INSERT INTO transcript_sources (symbol, source, url, fiscal_year, fiscal_quarter, call_date,
@@ -272,7 +227,7 @@ def _write(c, symbol: str, url: str, fy: int, fq: int, call_date: date | None, p
               source_url=EXCLUDED.source_url, raw_html=EXCLUDED.raw_html,
               raw_text=EXCLUDED.raw_text, word_count=EXCLUDED.word_count, parsed_at=now()
             RETURNING id""",
-            (symbol, fy, fq, call_date, call_date, url, json.dumps(payload), raw_text, len(raw_text.split())))
+            (symbol, fy, fq, call_date, call_date, url, json.dumps(turns), raw_text, len(raw_text.split())))
         tid = cur.fetchone()[0]
         _write_segments(cur, tid, parsed["turns"])
     c.commit()
@@ -281,7 +236,9 @@ def _write(c, symbol: str, url: str, fy: int, fq: int, call_date: date | None, p
 
 # -------------------------------------------------------------------------------- job
 def run(c, limit: int | None = None, refresh: bool = True, client: Equibles | None = None) -> None:
-    """Fill transcript gaps from Equibles, newest first; `limit` caps the gaps looked at."""
+    """Fill transcript gaps from Equibles; `limit` caps the gaps looked at. Ends with
+    db.refresh_word_counts (kalshi.resolve_speaker_roles(), then the mv_word_counts refresh)
+    unless `refresh` is False (the transcripts job refreshes once itself)."""
     api_key = os.getenv("EQUIBLES_API_KEY")
     if client is None and not api_key:
         log.warning("equibles: EQUIBLES_API_KEY is not set; skipping")
@@ -293,58 +250,56 @@ def run(c, limit: int | None = None, refresh: bool = True, client: Equibles | No
             todo = eligible[:limit] if limit is not None else eligible
             log.info("equibles: %d transcript gaps, %d not tried in the last %d days%s", total, len(eligible), RETRY_DAYS,
                      f"; looking at {len(todo)} (limit {limit})" if limit is not None else "")
-            listings: dict[str, object] = {}
-            filled = missed = 0
+            events: dict[str, list | None] = {}
+            stored = not_covered = no_match = other = 0
             stop = None
             for symbol, target in todo:
                 try:
-                    if symbol not in listings:
-                        listings[symbol] = eq.get(LIST_PATH.format(ticker=symbol))
-                    listing = listings[symbol]
-                    if listing is None:
-                        missed += 1
-                        _attempt(c, symbol, target, False, "ticker not found (404 on earnings-call list)")
+                    if symbol not in events:
+                        listing = eq.get(EVENTS_PATH.format(ticker=symbol))
+                        events[symbol] = None if listing is None else _data(listing, f"{symbol} investor-events")
+                    if events[symbol] is None:
+                        not_covered += 1
+                        _attempt(c, symbol, target, False, "not covered (404 on investor-events)")
                         continue
-                    ref = nearest_call(listing, target)
+                    ref = nearest_call(events[symbol], target)
                     if not ref:
-                        missed += 1
-                        _attempt(c, symbol, target, False, f"no listed call within {MATCH_DAYS} days")
+                        no_match += 1
+                        _attempt(c, symbol, target, False, f"no matching call (EarningsCall with transcript within "
+                                                           f"{MATCH_DAYS} days)")
                         continue
                     fy, fq = ref["fy"], ref["fq"]
                     if _have(c, symbol, fy, fq):
-                        missed += 1
+                        other += 1
                         _attempt(c, symbol, target, False, f"FY{fy} Q{fq} ({ref['date']}) already stored from equibles")
                         continue
-                    path = CALL_PATH.format(ticker=symbol, fy=fy, fq=fq)
-                    payload = eq.get(path)
-                    if payload is None:
-                        missed += 1
-                        _attempt(c, symbol, target, False, f"FY{fy} Q{fq} ({ref['date']}): no transcript (404)")
+                    head, turns = fetch_turns(eq, symbol, fy, fq)
+                    parsed = parse_turns(turns)
+                    if not parsed["turns"]:
+                        other += 1
+                        _attempt(c, symbol, target, False, f"FY{fy} Q{fq} ({ref['date']}): no transcript turns"
+                                                           f"{' (404)' if head is None else ''}")
                         continue
-                    parsed = parse_call(payload, _issuer(c, symbol))
-                    call_date = ref["date"] or parsed["call_date"]
-                    stats["rows"] += _write(c, symbol, BASE_URL + path, fy, fq, call_date, parsed, payload)
-                    filled += 1
+                    call_date = _date(head.get("callDate")) or ref["date"]
+                    stats["rows"] += _write(c, symbol, fy, fq, call_date, parsed, turns)
+                    stored += 1
                     _attempt(c, symbol, target, True, f"stored FY{fy} Q{fq}, call {call_date}, {len(parsed['turns'])} turns")
                     log.info("equibles: %s gap %s filled: FY%d Q%d, call %s, %d turns, %d words", symbol, target, fy, fq,
                              call_date, len(parsed["turns"]), len(parsed["raw_text"].split()))
-                except QuotaExhausted as e:
+                except (QuotaExhausted, ShapeError) as e:
                     c.rollback()
-                    stop = f"stopped: {e}"
-                    break
-                except ShapeError as e:
-                    c.rollback()
-                    stop = f"stopped on an unreadable response for {symbol} {target} (no attempt recorded): {e}"
+                    stop = f"stopped at {symbol} {target} (no attempt recorded): {e}"
                     break
                 except Exception as e:  # noqa: BLE001
                     c.rollback()
-                    missed += 1
+                    other += 1
                     log.warning("equibles: %s gap %s failed: %s", symbol, target, e)
                     _attempt(c, symbol, target, False, f"{type(e).__name__}: {e}")
             if stop:
                 log.warning("equibles: %s", stop)
-            log.info("equibles: done: %d gaps, %d filled, %d still missing, %d not reached; %d/%d requests used",
-                     total, filled, total - filled, len(todo) - filled - missed, eq.used, eq.budget)
+            log.info("equibles: done: %d/%d requests used, %d symbols listed, %d calls stored, %d not covered, "
+                     "%d no matching call, %d other misses; %d of %d gaps still open",
+                     eq.used, eq.budget, len(events), stored, not_covered, no_match, other, total - stored, total)
     finally:
         if client is None:
             eq.close()
