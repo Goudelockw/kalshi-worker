@@ -24,6 +24,9 @@
   python -m kalshi_worker fortune [--symbol SYM] [--limit N]   Fortune.com (Quartr) transcripts:
                                        find missing company slugs, then store new / pending
                                        calls (also runs at the end of `transcripts`)
+  python -m kalshi_worker equibles [--limit N]   Equibles transcripts for calls no other source has
+                                       (kalshi.v_transcript_gaps), at most 80 API requests per run;
+                                       needs EQUIBLES_API_KEY (also runs at the end of `transcripts`)
   python -m kalshi_worker reactions [--days N]   1-minute candles around earnings press
                                        releases for mention markets (default 3; 90 for backfill)
   python -m kalshi_worker worker       always-on: snapshot every N minutes
@@ -38,7 +41,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("kalshi_worker")
 
-from . import db, filings, fortune, jobs, reactions, transcripts  # noqa: E402  (after load_dotenv so DATABASE_URL is present)
+from . import db, equibles, filings, fortune, jobs, reactions, transcripts  # noqa: E402  (after load_dotenv so DATABASE_URL is present)
 from .client import KalshiClient  # noqa: E402
 
 
@@ -93,6 +96,8 @@ def run(cmd: str, args: list[str] = ()) -> None:
         elif cmd == "fortune":
             sym = _sopt("symbol", list(args))
             fortune.run(c, symbol=sym.upper() if sym else None, limit=_opt("limit", list(args)))
+        elif cmd == "equibles":
+            equibles.run(c, limit=_opt("limit", list(args)))
         elif cmd == "reactions":
             reactions.run(k, c, days=_opt("days", list(args)) or reactions.DEFAULT_DAYS)
         else:

@@ -540,12 +540,13 @@ def run(c, limit: int | None = None, discover_months: int = DISCOVER_MONTHS) -> 
                 log.info("transcripts: %d/%d done (%d parsed, %d failed) in %.0fs",
                          i, len(queue), ok, failed, time.monotonic() - t0)
     http.close()
-    from . import fortune   # imports this module; deferred to avoid a cycle
-    try:
-        fortune.run(c, refresh=False)
-    except Exception as e:  # noqa: BLE001
-        c.rollback()
-        log.warning("transcripts: fortune step failed: %s", e)
+    from . import equibles, fortune   # both import this module; deferred to avoid a cycle
+    for name, step in (("fortune", fortune.run), ("equibles", equibles.run)):
+        try:
+            step(c, refresh=False)
+        except Exception as e:  # noqa: BLE001
+            c.rollback()
+            log.warning("transcripts: %s step failed: %s", name, e)
     uncovered = _uncovered(c)
     log.info("transcripts: coverage: %d tracked symbols with 0 transcripts%s", len(uncovered),
              f": {', '.join(uncovered)}" if uncovered else "")

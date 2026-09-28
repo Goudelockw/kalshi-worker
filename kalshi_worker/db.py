@@ -223,7 +223,19 @@ def delete_state(c, job: str) -> int:
 
 
 def refresh_word_counts(c) -> None:
-    """REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_counts; a failure is logged, not raised."""
+    """kalshi.resolve_speaker_roles() (fills transcript_segments.role_resolved), then REFRESH
+    MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_counts; each step commits, and a failure in
+    either is logged, not raised."""
+    try:
+        c.commit()
+        with c.cursor() as cur:
+            cur.execute("SELECT kalshi.resolve_speaker_roles()")
+            n = cur.fetchone()[0]
+        c.commit()
+        log.info("resolved speaker roles (%s)", n)
+    except Exception as e:  # noqa: BLE001
+        c.rollback()
+        log.warning("kalshi.resolve_speaker_roles() failed: %s", e)
     try:
         c.commit()
         with c.cursor() as cur:
