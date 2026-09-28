@@ -282,6 +282,7 @@ def sync(k: KalshiClient, c, sweep_max: int = SWEEP_MAX) -> None:
             c.commit()
         with _stage("sync", "stale sweep"):
             stats["rows"] += stale_sweep(k, c, seen, sweep_max)
+        db.refresh_word_counts(c)
 
 
 # --------------------------------------------------------------------------- snapshot
