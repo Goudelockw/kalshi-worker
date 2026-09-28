@@ -252,6 +252,7 @@ def sweep(k: KalshiClient, c, max_markets: int = SWEEP_MAX) -> None:
 def sync(k: KalshiClient, c, sweep_max: int = SWEEP_MAX) -> None:
     """Hourly: series; open events + markets; then, for open markets in watchlisted series
     only, recent hourly candles, 1-minute candles (minute_candles) and new trades (trades);
+    3 hours of hourly candles for open KXEARNINGSMENTION markets whose call is within 2 days;
     finally the stale sweep over non-final markets that weren't in the open-events pull."""
     with db.run_log(c, "sync") as stats:
         with _stage("sync", "series"):
@@ -266,11 +267,16 @@ def sync(k: KalshiClient, c, sweep_max: int = SWEEP_MAX) -> None:
         watch = db.watchlist(c)
         now = _now()
         with _stage("sync", "hourly candles (3h)"):
-            tickers = [m["ticker"] for m in _open_markets(c, [w["series_ticker"] for w in watch])]
-            stats["rows"] += _batch_candles(k, c, tickers, HOUR, _epoch(now - timedelta(hours=3)), _epoch(now))
+            hourly = [m["ticker"] for m in _open_markets(c, [w["series_ticker"] for w in watch])]
+            stats["rows"] += _batch_candles(k, c, hourly, HOUR, _epoch(now - timedelta(hours=3)), _epoch(now))
         with _stage("sync", "minute candles (2h)"):
             tickers = [m["ticker"] for m in _open_markets(c, [w["series_ticker"] for w in watch if w["minute_candles"]])]
             stats["rows"] += _batch_candles(k, c, tickers, MINUTE, _epoch(now - timedelta(hours=2)), _epoch(now))
+        with _stage("sync", "earnings-mention hourly candles (3h, calls within 2 days)"):
+            from . import precall   # imports this module; deferred to avoid a cycle
+            done = set(hourly)
+            tickers = [t for t in precall.upcoming_tickers(c) if t not in done]
+            stats["rows"] += _batch_candles(k, c, tickers, HOUR, _epoch(now - timedelta(hours=3)), _epoch(now))
         with _stage("sync", "trades"):
             for m in _open_markets(c, [w["series_ticker"] for w in watch if w["trades"]]):
                 job = f"trades:{m['ticker']}"
@@ -307,7 +313,8 @@ def snapshot(k: KalshiClient, c, interval_min: int = 5) -> None:
 def reconcile(k: KalshiClient, c, sweep_max: int = SWEEP_MAX) -> None:
     """Nightly: daily candles over the full life of each market settled in the last 3 days;
     hourly too for markets in watchlisted series. Then the stale sweep, which locks in
-    status/result for markets that have closed or settled."""
+    status/result for markets that have closed or settled, and the 48h pre-call hourly
+    windows for earnings-mention markets settled in the last 3 days (precall.fill)."""
     with db.run_log(c, "reconcile") as stats:
         since = _now() - timedelta(days=3)
         rows = _market_rows(c, "settled_time >= %s AND ticker NOT LIKE %s", (since, "KXMVE%"))
@@ -319,3 +326,6 @@ def reconcile(k: KalshiClient, c, sweep_max: int = SWEEP_MAX) -> None:
                     stats["rows"] += _batch_candles(k, c, tickers, period, s, e)
         with _stage("reconcile", "stale sweep"):
             stats["rows"] += stale_sweep(k, c, max_markets=sweep_max)
+        with _stage("reconcile", "pre-call hourly windows (settled 3d)"):
+            from . import precall   # imports this module; deferred to avoid a cycle
+            stats["rows"] += precall.fill(k, c, settled_days=3)["candles"]
