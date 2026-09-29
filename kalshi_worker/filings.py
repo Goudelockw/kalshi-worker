@@ -21,7 +21,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
-from . import db
+from . import db, tickers
 
 log = logging.getLogger(__name__)
 
@@ -301,11 +301,15 @@ def _symbols(c) -> list[str]:
         return [r[0] for r in cur.fetchall() if r[0]]
 
 
-def _upsert_company(c, symbol: str, cik: str, name: str) -> None:
+def _upsert_company(c, symbol: str, ticker: str, cik: str | None, name: str | None) -> None:
+    """company_map row for a Kalshi symbol. An existing ticker is kept (company_map is the source
+    of truth once set); cik/name are only overwritten with non-null values."""
     with c.cursor() as cur:
-        cur.execute("""INSERT INTO company_map (symbol, cik, name, updated_at) VALUES (%s, %s, %s, now())
-                       ON CONFLICT (symbol) DO UPDATE SET cik = EXCLUDED.cik, name = EXCLUDED.name, updated_at = now()""",
-                    (symbol, cik, name))
+        cur.execute("""INSERT INTO company_map (symbol, ticker, cik, name, updated_at) VALUES (%s, %s, %s, %s, now())
+                       ON CONFLICT (symbol) DO UPDATE SET ticker = coalesce(company_map.ticker, EXCLUDED.ticker),
+                         cik = coalesce(EXCLUDED.cik, company_map.cik), name = coalesce(EXCLUDED.name, company_map.name),
+                         updated_at = now()""",
+                    (symbol, ticker, cik, name))
 
 
 def _update_sic(c, symbol: str, sic: str | None, sic_description: str | None) -> None:
@@ -396,18 +400,29 @@ def run(c, days: int = DEFAULT_DAYS, edgar: Edgar | None = None) -> None:
         symbols = _symbols(c)
         log.info("filings: %d symbols with earnings-mention markets", len(symbols))
 
-        # 2. CIKs
+        # 2. company_map rows (ticker = company_map.ticker or the alias) and CIKs looked up by ticker;
+        #    TSX-only listings keep a null CIK. Filings are fetched once per ticker, under its
+        #    canonical Kalshi symbol (ADBE, not the older ADOBE series), so accession-keyed rows
+        #    don't flip between symbols.
         ciks = cik_map(edgar.json(TICKERS_URL))
-        resolved: dict[str, tuple[str, str]] = {}
-        for s in symbols:
-            hit = ciks.get(_norm(s))
+        sym_tickers = {s: t for s, t in tickers.mention_tickers(c).items() if s in symbols}
+        found: dict[str, tuple[str, str]] = {}
+        for s, t in sorted(sym_tickers.items()):
+            if s in tickers.TSX_ONLY:
+                _upsert_company(c, s, t, None, tickers.TSX_ONLY[s])
+                continue
+            hit = ciks.get(_norm(t))
+            _upsert_company(c, s, t, hit[0] if hit else None, hit[1] if hit else None)
             if hit:
-                resolved[s] = hit
-                _upsert_company(c, s, hit[0], hit[1])
+                found[s] = hit
         c.commit()
-        unresolved = sorted(set(symbols) - set(resolved))
-        log.info("filings: %d/%d symbols resolved to a CIK%s", len(resolved), len(symbols),
-                 f"; unresolved: {', '.join(unresolved)}" if unresolved else "")
+        canonical = tickers.canonical(sym_tickers)
+        resolved = {s: hit for s, hit in found.items() if s in canonical}
+        shared = sorted(f"{s}->{sym_tickers[s]}" for s in found if s not in canonical)
+        unresolved = sorted(set(symbols) - set(found))
+        log.info("filings: %d/%d symbols resolved to a CIK%s%s", len(found), len(symbols),
+                 f"; unresolved: {', '.join(unresolved)}" if unresolved else "",
+                 f"; fetched under another symbol with the same ticker: {', '.join(shared)}" if shared else "")
 
         # 3 + 4. submissions -> new 8-K 2.02 / 6-K results filings -> Exhibit 99.1 text
         done = db.states_with_prefix(c, BACKFILL_STATE)

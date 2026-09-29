@@ -1,8 +1,9 @@
 """Hourly candles around earnings calls for KXEARNINGSMENTION markets.
 
-Settled calls: an event's call end is min(markets.close_time) over its settled markets (the
-markets close when the call ends). Each market gets period=60 candles for
-[call_end - 48h, call_end + 1h]. Markets settled before GET /historical/cutoff's
+Settled calls: each event is anchored on its estimated call start (kalshi.mv_call_times
+.call_start_est), else on min(markets.close_time) over its settled markets (the markets close
+when the call ends). Each market gets period=60 candles for
+[anchor - 48h, max(anchor + 3h, min(close_time) + 1h)]. Markets settled before GET /historical/cutoff's
 market_settled_ts go one at a time through /historical/markets/{ticker}/candlesticks; the rest
 share one batch call per event through jobs._batch_candles. A market is done once a fetch
 succeeded (sync_state 'precall_done:<ticker>') or it already has >= MIN_CANDLES hourly candles
@@ -26,8 +27,9 @@ from .transcripts import MONTHS, parse_date
 log = logging.getLogger(__name__)
 
 SERIES_LIKE = "KXEARNINGSMENTION%"
-BEFORE = timedelta(hours=48)
-AFTER = timedelta(hours=1)
+BEFORE = timedelta(hours=48)       # before the anchor (the call start)
+AFTER_START = timedelta(hours=3)   # the window runs to at least anchor + 3h ...
+AFTER = timedelta(hours=1)         # ... and at least an hour past the markets' close
 MIN_CANDLES = 40
 STATE_PREFIX = "precall_done:"
 UPCOMING_DAYS = 2
@@ -45,18 +47,23 @@ def _hour_ceil(dt: datetime) -> datetime:
 
 # ---------------------------------------------------------------------- settled calls
 def events(c, settled_days: int | None = None) -> list[dict]:
-    """Settled KXEARNINGSMENTION events, newest call first: {event_ticker, call_end, start,
-    end, markets: [{ticker, settled_at}]}. `settled_days` keeps events whose markets settled in
-    the last N days."""
+    """Settled KXEARNINGSMENTION events, newest call first: {event_ticker, call_end, anchor,
+    anchor_source, start, end, markets: [{ticker, settled_at}]}. The anchor is the estimated call
+    start (kalshi.mv_call_times.call_start_est) when known, else the markets' earliest close; the
+    window is [anchor - 48h, max(anchor + 3h, call_end + 1h)]. `settled_days` keeps events whose
+    markets settled in the last N days."""
     with c.cursor() as cur:
-        cur.execute("""SELECT m.event_ticker, m.ticker, m.close_time, coalesce(m.settled_time, m.close_time)
+        cur.execute("""SELECT m.event_ticker, m.ticker, m.close_time, coalesce(m.settled_time, m.close_time),
+                              ct.call_start_est
                        FROM markets m
+                       LEFT JOIN mv_call_times ct ON ct.event_ticker = m.event_ticker
                        WHERE m.series_ticker LIKE %s AND m.result <> '' AND m.close_time IS NOT NULL
                          AND m.event_ticker IS NOT NULL""", (SERIES_LIKE,))
         rows = cur.fetchall()
     by_event: dict[str, dict] = {}
-    for ev, ticker, close, settled in rows:
-        e = by_event.setdefault(ev, {"event_ticker": ev, "call_end": close, "settled": settled, "markets": []})
+    for ev, ticker, close, settled, call_start in rows:
+        e = by_event.setdefault(ev, {"event_ticker": ev, "call_end": close, "settled": settled,
+                                     "call_start": call_start, "markets": []})
         e["call_end"] = min(e["call_end"], close)
         e["settled"] = max(e["settled"], settled)
         e["markets"].append({"ticker": ticker, "settled_at": settled})
@@ -65,10 +72,12 @@ def events(c, settled_days: int | None = None) -> list[dict]:
     for e in by_event.values():
         if since and e["settled"] < since:
             continue
-        e["start"] = _hour_floor(e["call_end"] - BEFORE)
-        e["end"] = _hour_ceil(e["call_end"] + AFTER)
+        e["anchor"], e["anchor_source"] = ((e["call_start"], "call_start_est") if e["call_start"]
+                                           else (e["call_end"], "min(close_time)"))
+        e["start"] = _hour_floor(e["anchor"] - BEFORE)
+        e["end"] = _hour_ceil(max(e["anchor"] + AFTER_START, e["call_end"] + AFTER))
         out.append(e)
-    return sorted(out, key=lambda e: e["call_end"], reverse=True)
+    return sorted(out, key=lambda e: e["anchor"], reverse=True)
 
 
 def _covered(c, evs: list[dict]) -> set[str]:
@@ -95,13 +104,18 @@ def _mark(c, tickers) -> None:
         db.set_state(c, STATE_PREFIX + t, meta={"period": HOUR})
 
 
-def fill(k: KalshiClient, c, limit: int | None = None, settled_days: int | None = None) -> dict:
-    """Fetch the 48h-before / 1h-after hourly window for settled markets not yet done. `limit`
-    caps the events looked at. Returns {"markets", "candles", "live", "historical", "failed"}."""
+def fill(k: KalshiClient, c, limit: int | None = None, settled_days: int | None = None,
+         only_events: set[str] | None = None, force: bool = False) -> dict:
+    """Fetch each settled market's hourly window (see events()) unless it's already done.
+    `limit` caps the events looked at, `only_events` restricts them, and `force` fetches even
+    markets already marked done / covered. Returns {"markets", "candles", "live",
+    "historical", "failed"}."""
     evs = events(c, settled_days)
+    if only_events is not None:
+        evs = [e for e in evs if e["event_ticker"] in only_events]
     if limit is not None:
         evs = evs[:limit]
-    covered = _covered(c, evs)
+    covered = set() if force else _covered(c, evs)
     cutoff = k.cutoff()
     cutoff_ts = db._ts(cutoff.get("market_settled_ts") or cutoff.get("settled_ts"))
     todo = [(e, [m for m in e["markets"] if m["ticker"] not in covered]) for e in evs]
@@ -121,6 +135,7 @@ def fill(k: KalshiClient, c, limit: int | None = None, settled_days: int | None 
     with _stage("precall", f"hourly windows ({len(todo)} events)"):
         for e, ms in todo:
             s, end = _epoch(e["start"]), _epoch(min(e["end"], _now()))
+            ev_before, ev_failed = stats["candles"], stats["failed"]
             live = [m["ticker"] for m in ms if not (cutoff_ts and m["settled_at"] < cutoff_ts)]
             hist = [m["ticker"] for m in ms if cutoff_ts and m["settled_at"] < cutoff_ts]
             if live:
@@ -139,14 +154,46 @@ def fill(k: KalshiClient, c, limit: int | None = None, settled_days: int | None 
                     c.rollback()
                     stats["failed"] += 1
                     log.warning("precall: historical candles failed for %s: %s", t, ex)
+            log.info("precall: %s anchor %s (%s), window %s..%s: %d markets, %d candles fetched%s",
+                     e["event_ticker"], e["anchor"], e["anchor_source"], e["start"], e["end"], len(ms),
+                     stats["candles"] - ev_before,
+                     f", {stats['failed'] - ev_failed} failed" if stats["failed"] > ev_failed else "")
     log.info("precall: done: %d markets (%d live, %d historical), %d candles written, %d failed",
              stats["markets"], stats["live"], stats["historical"], stats["candles"], stats["failed"])
     return stats
 
 
-def run(k: KalshiClient, c, limit: int | None = None) -> None:
-    with db.run_log(c, "precall") as stats:
-        stats["rows"] += fill(k, c, limit=limit)["candles"]
+def missing_price_events(c) -> set[str]:
+    """Events whose pre-call prices are incomplete in kalshi.mv_precall_prices (no quote at the call
+    start / an hour before, or none 24h before)."""
+    with c.cursor() as cur:
+        cur.execute("""SELECT DISTINCT event_ticker FROM kalshi.mv_precall_prices
+                       WHERE coalesce(bid_call_start, bid_1h) IS NULL OR bid_24h IS NULL""")
+        return {r[0] for r in cur.fetchall() if r[0]}
+
+
+def refetch_missing(k: KalshiClient, c, limit: int | None = None) -> dict:
+    """One-off: clear precall_done for the markets of events with incomplete pre-call prices and
+    fetch their (call-start anchored) windows again, bypassing the MIN_CANDLES check."""
+    evs_missing = missing_price_events(c)
+    targets = [e for e in events(c) if e["event_ticker"] in evs_missing]
+    cleared = 0
+    for e in targets:
+        for m in e["markets"]:
+            cleared += db.delete_state(c, STATE_PREFIX + m["ticker"])
+    c.commit()
+    log.info("precall: refetch: %d events with incomplete pre-call prices (%d settled here), %d precall_done "
+             "markers cleared", len(evs_missing), len(targets), cleared)
+    return fill(k, c, limit=limit, only_events={e["event_ticker"] for e in targets}, force=True)
+
+
+def run(k: KalshiClient, c, limit: int | None = None, refetch: bool = False) -> None:
+    """`refetch`: the one-off re-fetch for events with incomplete pre-call prices, followed by the
+    materialized-view refresh so kalshi.mv_precall_prices picks the new candles up."""
+    with db.run_log(c, "precall_refetch" if refetch else "precall") as stats:
+        stats["rows"] += (refetch_missing(k, c, limit) if refetch else fill(k, c, limit=limit))["candles"]
+    if refetch:
+        db.refresh_word_counts(c)
 
 
 # --------------------------------------------------------------------- upcoming calls

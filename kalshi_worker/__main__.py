@@ -27,9 +27,12 @@
   python -m kalshi_worker equibles [--limit N]   Equibles transcripts for calls no other source has
                                        (kalshi.v_transcript_gaps), at most 90 API requests per run;
                                        needs EQUIBLES_API_KEY (also runs at the end of `transcripts`)
-  python -m kalshi_worker precall [--limit N]   hourly candles from 48h before to 1h after each
-                                       settled earnings-mention call (newest events first;
-                                       --limit caps events); reconcile runs it for the last 3 days
+  python -m kalshi_worker precall [--limit N] [--refetch-missing]   hourly candles from 48h before
+                                       each settled earnings-mention call's start to 3h after it
+                                       (and 1h past the close); newest events first, --limit caps
+                                       events; reconcile runs it for the last 3 days.
+                                       --refetch-missing: one-off re-fetch for events with incomplete
+                                       prices in mv_precall_prices, then the view refresh
   python -m kalshi_worker mentions-backfill   one-off: every KXEARNINGSMENTION series, its events and
                                        settled markets (archive + live tier), then precall for
                                        settled markets without hourly windows; resumable per series
@@ -107,7 +110,7 @@ def run(cmd: str, args: list[str] = ()) -> None:
         elif cmd == "mentions-backfill":
             mentions.run(k, c)
         elif cmd == "precall":
-            precall.run(k, c, limit=_opt("limit", list(args)))
+            precall.run(k, c, limit=_opt("limit", list(args)), refetch="--refetch-missing" in args)
         elif cmd == "reactions":
             reactions.run(k, c, days=_opt("days", list(args)) or reactions.DEFAULT_DAYS)
         else:
