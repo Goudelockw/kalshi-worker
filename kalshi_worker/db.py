@@ -226,6 +226,9 @@ def delete_state(c, job: str) -> int:
 REFRESH_VIEWS = (   # in dependency order; CONCURRENTLY where the view has a unique index
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_counts",
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_call_stats",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_call_analysts",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_call_analyst_stats",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_analyst_features",
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_call_features",
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_call_execs",
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_earnings_dates",
