@@ -28,7 +28,7 @@ from datetime import date
 
 import httpx
 
-from . import db
+from . import db, tickers
 from .transcripts import ANALYST_WORDS, _write_segments
 
 log = logging.getLogger(__name__)
@@ -156,23 +156,23 @@ def parse_turns(turns: list[dict]) -> dict:
     return {"turns": out, "raw_text": "\n\n".join(t["text"] for t in out)}
 
 
-def fetch_turns(eq: Equibles, symbol: str, fy: int, fq: int) -> tuple[dict | None, list[dict]]:
+def fetch_turns(eq: Equibles, ticker: str, fy: int, fq: int) -> tuple[dict | None, list[dict]]:
     """All pages of a call's /speakers -> (first page's envelope, turns). (None, []) on 404.
     QuotaExhausted propagates, so a call is either fetched whole or not at all."""
-    path = SPEAKERS_PATH.format(ticker=symbol, fy=fy, fq=fq)
+    path = SPEAKERS_PATH.format(ticker=ticker, fy=fy, fq=fq)
     head, turns, offset = None, [], 0
     for _ in range(MAX_PAGES):
         page = eq.get(path, {"offset": offset})
         if page is None:
             return None, []
-        items = _data(page, f"{symbol} FY{fy} Q{fq} speakers")
+        items = _data(page, f"{ticker} FY{fy} Q{fq} speakers")
         head = head or page
         turns.extend(items)
         if not page.get("hasMore") or not items:
             break
         offset += len(items)
     else:
-        log.warning("equibles: %s FY%d Q%d still hasMore after %d pages; keeping %d turns", symbol, fy, fq,
+        log.warning("equibles: %s FY%d Q%d still hasMore after %d pages; keeping %d turns", ticker, fy, fq,
                     MAX_PAGES, len(turns))
     return head, turns
 
@@ -207,8 +207,9 @@ def _attempt(c, symbol: str, target: date, ok: bool, note: str) -> None:
     c.commit()
 
 
-def _write(c, symbol: str, fy: int, fq: int, call_date: date | None, parsed: dict, turns: list[dict]) -> int:
-    url = SOURCE_URL.format(ticker=symbol.lower(), fy=fy, fq=fq)
+def _write(c, symbol: str, ticker: str, fy: int, fq: int, call_date: date | None, parsed: dict,
+           turns: list[dict]) -> int:
+    url = SOURCE_URL.format(ticker=ticker.lower(), fy=fy, fq=fq)
     raw_text = parsed["raw_text"]
     with c.cursor() as cur:
         cur.execute("""INSERT INTO transcript_sources (symbol, source, url, fiscal_year, fiscal_quarter, call_date,
@@ -250,19 +251,21 @@ def run(c, limit: int | None = None, refresh: bool = True, client: Equibles | No
             todo = eligible[:limit] if limit is not None else eligible
             log.info("equibles: %d transcript gaps, %d not tried in the last %d days%s", total, len(eligible), RETRY_DAYS,
                      f"; looking at {len(todo)} (limit {limit})" if limit is not None else "")
-            events: dict[str, list | None] = {}
+            sym_tickers = tickers.mention_tickers(c)
+            events: dict[str, list | None] = {}     # investor-events listing per ticker
             stored = not_covered = no_match = other = 0
             stop = None
             for symbol, target in todo:
                 try:
-                    if symbol not in events:
-                        listing = eq.get(EVENTS_PATH.format(ticker=symbol))
-                        events[symbol] = None if listing is None else _data(listing, f"{symbol} investor-events")
-                    if events[symbol] is None:
+                    ticker = sym_tickers.get(symbol) or tickers.alias(symbol)   # API paths use the ticker
+                    if ticker not in events:
+                        listing = eq.get(EVENTS_PATH.format(ticker=ticker))
+                        events[ticker] = None if listing is None else _data(listing, f"{ticker} investor-events")
+                    if events[ticker] is None:
                         not_covered += 1
                         _attempt(c, symbol, target, False, "not covered (404 on investor-events)")
                         continue
-                    ref = nearest_call(events[symbol], target)
+                    ref = nearest_call(events[ticker], target)
                     if not ref:
                         no_match += 1
                         _attempt(c, symbol, target, False, f"no matching call (EarningsCall with transcript within "
@@ -273,7 +276,7 @@ def run(c, limit: int | None = None, refresh: bool = True, client: Equibles | No
                         other += 1
                         _attempt(c, symbol, target, False, f"FY{fy} Q{fq} ({ref['date']}) already stored from equibles")
                         continue
-                    head, turns = fetch_turns(eq, symbol, fy, fq)
+                    head, turns = fetch_turns(eq, ticker, fy, fq)
                     parsed = parse_turns(turns)
                     if not parsed["turns"]:
                         other += 1
@@ -281,7 +284,7 @@ def run(c, limit: int | None = None, refresh: bool = True, client: Equibles | No
                                                            f"{' (404)' if head is None else ''}")
                         continue
                     call_date = _date(head.get("callDate")) or ref["date"]
-                    stats["rows"] += _write(c, symbol, fy, fq, call_date, parsed, turns)
+                    stats["rows"] += _write(c, symbol, ticker, fy, fq, call_date, parsed, turns)
                     stored += 1
                     _attempt(c, symbol, target, True, f"stored FY{fy} Q{fq}, call {call_date}, {len(parsed['turns'])} turns")
                     log.info("equibles: %s gap %s filled: FY%d Q%d, call %s, %d turns, %d words", symbol, target, fy, fq,

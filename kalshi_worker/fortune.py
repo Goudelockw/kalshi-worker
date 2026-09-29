@@ -23,7 +23,7 @@ from urllib.parse import urljoin
 
 import httpx
 
-from . import db
+from . import db, tickers
 from .transcripts import USER_AGENT, _mention_symbols, _write_segments, fetch
 
 log = logging.getLogger(__name__)
@@ -90,15 +90,17 @@ def slug_candidates(name: str | None) -> list[str]:
     return out
 
 
-def ticker_matches(ticker: str | None, symbol: str) -> bool:
+def ticker_matches(ticker: str | None, expected: str) -> bool:
+    """Fortune's companyInfo.Ticker against the company's exchange ticker (company_map.ticker,
+    not the Kalshi symbol: ADBE for ADOBE), ignoring '.'; GOOGL also takes GOOG."""
     t = (ticker or "").replace(".", "").upper()
-    s = symbol.replace(".", "").upper()
+    s = expected.replace(".", "").upper()
     return bool(t) and (t == s or t in TICKER_ALIASES.get(s, set()))
 
 
-def _slug_todo(c, symbols: list[str], force: bool) -> list[tuple[str, str]]:
+def _slug_todo(c, symbols: list[str], force: bool) -> list[tuple[str, str, str | None]]:
     with c.cursor() as cur:
-        cur.execute(f"""SELECT symbol, name FROM company_map
+        cur.execute(f"""SELECT symbol, name, ticker FROM company_map
                         WHERE symbol = ANY(%s) AND fortune_slug IS NULL AND coalesce(name, '') <> ''
                           {"" if force else "AND (fortune_checked_at IS NULL OR fortune_checked_at < now() - %s * interval '1 day')"}
                         ORDER BY symbol""", (symbols,) if force else (symbols, RECHECK_DAYS))
@@ -109,7 +111,8 @@ def discover_slugs(f: Fortune, c, symbols: list[str], force: bool = False) -> tu
     """Find fortune_slug for companies without one. Returns (checked, found)."""
     todo = _slug_todo(c, symbols, force)
     found = 0
-    for symbol, name in todo:
+    for symbol, name, ticker in todo:
+        ticker = ticker or tickers.alias(symbol)
         hit = None
         for cand in slug_candidates(name):
             try:
@@ -121,7 +124,7 @@ def discover_slugs(f: Fortune, c, symbols: list[str], force: bool = False) -> tu
             except Exception as e:  # noqa: BLE001
                 log.warning("fortune: %s slug %r: %s", symbol, cand, e)
                 continue
-            if ticker_matches(info.get("Ticker") or info.get("ticker"), symbol):
+            if ticker_matches(info.get("Ticker") or info.get("ticker"), ticker):
                 hit = cand
                 break
         with c.cursor() as cur:
@@ -129,7 +132,7 @@ def discover_slugs(f: Fortune, c, symbols: list[str], force: bool = False) -> tu
                            WHERE symbol = %s""", (hit, symbol))
         c.commit()
         found += hit is not None
-        log.info("fortune: %s (%s): %s", symbol, name, f"slug {hit!r}" if hit else "no slug matched")
+        log.info("fortune: %s (%s, ticker %s): %s", symbol, name, ticker, f"slug {hit!r}" if hit else "no slug matched")
     return len(todo), found
 
 

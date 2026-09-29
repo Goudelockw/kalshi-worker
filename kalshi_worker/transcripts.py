@@ -15,7 +15,7 @@ from datetime import date
 
 import httpx
 
-from . import db
+from . import db, tickers
 
 log = logging.getLogger(__name__)
 
@@ -324,11 +324,10 @@ def _months(today: date, n: int) -> list[tuple[int, int]]:
 
 
 def _mention_symbols(c) -> dict[str, str]:
-    """{normalized symbol: Kalshi symbol} for every KXEARNINGSMENTION<symbol> series seen."""
-    with c.cursor() as cur:
-        cur.execute("""SELECT DISTINCT substring(series_ticker FROM '^KXEARNINGSMENTION(.+)$')
-                       FROM markets WHERE series_ticker LIKE 'KXEARNINGSMENTION%'""")
-        return {_norm(r[0]): r[0] for r in cur.fetchall() if r[0]}
+    """{normalized ticker: Kalshi symbol} for the KXEARNINGSMENTION<symbol> series: sitemap slugs
+    carry the exchange ticker (company_map.ticker, e.g. ADBE for ADOBE), and a ticker shared by
+    several Kalshi symbols maps to one of them (tickers.canonical) so each URL is queued once."""
+    return {_norm(t): s for s, t in tickers.canonical(tickers.mention_tickers(c)).items()}
 
 
 def _norm(symbol: str) -> str:
@@ -487,7 +486,7 @@ def _uncovered(c) -> list[str]:
     with c.cursor() as cur:
         cur.execute("""SELECT s.sym FROM unnest(%s::text[]) s(sym)
                        WHERE NOT EXISTS (SELECT 1 FROM transcripts t WHERE t.symbol = s.sym) ORDER BY 1""",
-                    (sorted(set(_mention_symbols(c).values())),))
+                    (tickers.mention_symbols(c),))
         return [r[0] for r in cur.fetchall()]
 
 
