@@ -236,6 +236,7 @@ REFRESH_VIEWS = (   # in dependency order; CONCURRENTLY where the view has a uni
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_segment_tsv",
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_corpus_hits",
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_corpus",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_context",
     "REFRESH MATERIALIZED VIEW kalshi.mv_call_times",
     "REFRESH MATERIALIZED VIEW kalshi.mv_precall_prices",
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_features",
@@ -244,12 +245,20 @@ REFRESH_VIEWS = (   # in dependency order; CONCURRENTLY where the view has a uni
 REFRESH_TIMEOUT = "10min"
 
 
-def refresh_word_counts(c) -> None:
+def refresh_word_counts(c) -> list[str]:
     """kalshi.resolve_speaker_roles() (fills transcript_segments.role_resolved), then every
     materialized view in REFRESH_VIEWS, in order. Each statement runs in its own transaction
     with SET LOCAL statement_timeout = 10min (so the timeout ends with it) and commits; its
-    elapsed seconds are logged, and a failure is logged and skipped, not raised."""
-    def step(label: str, sql: str):
+    elapsed seconds are logged, and a failure is logged and skipped, not raised. Ends with a
+    summary line and returns the names of the steps that failed (empty when all succeeded)."""
+    steps = [("resolve_speaker_roles", "SELECT kalshi.resolve_speaker_roles()")]
+    steps += [(sql.rsplit(".", 1)[-1], sql) for sql in REFRESH_VIEWS]
+    failed: list[str] = []
+    t_all = time.monotonic()
+    log.info("refresh: starting %d steps", len(steps))
+    for name, sql in steps:
+        label = "kalshi.resolve_speaker_roles()" if name == "resolve_speaker_roles" else \
+            sql.replace("REFRESH MATERIALIZED VIEW ", "refresh ")
         t0 = time.monotonic()
         try:
             c.commit()
@@ -260,12 +269,17 @@ def refresh_word_counts(c) -> None:
             c.commit()
             log.info("%s done in %.1fs%s", label, time.monotonic() - t0, f" ({out})" if out is not None else "")
         except Exception as e:  # noqa: BLE001
-            c.rollback()
+            failed.append(name)
             log.warning("%s failed after %.1fs: %s", label, time.monotonic() - t0, e)
-
-    step("kalshi.resolve_speaker_roles()", "SELECT kalshi.resolve_speaker_roles()")
-    for sql in REFRESH_VIEWS:
-        step(sql.replace("REFRESH MATERIALIZED VIEW ", "refresh "), sql)
+            try:
+                c.rollback()
+            except Exception as e2:  # noqa: BLE001  (a broken connection must not end the chain unlogged)
+                log.warning("refresh: rollback after %s failed: %s", name, e2)
+    if failed:
+        log.warning("refresh: %d of %d steps failed: %s", len(failed), len(steps), ", ".join(failed))
+    else:
+        log.info("refresh: all %d steps done in %.0fs", len(steps), time.monotonic() - t_all)
+    return failed
 
 
 def watchlist(c) -> list[dict]:

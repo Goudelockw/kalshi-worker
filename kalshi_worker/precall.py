@@ -189,11 +189,18 @@ def refetch_missing(k: KalshiClient, c, limit: int | None = None) -> dict:
 
 def run(k: KalshiClient, c, limit: int | None = None, refetch: bool = False) -> None:
     """`refetch`: the one-off re-fetch for events with incomplete pre-call prices, followed by the
-    materialized-view refresh so kalshi.mv_precall_prices picks the new candles up."""
+    materialized-view refresh so kalshi.mv_precall_prices picks the new candles up. The refresh
+    runs inside the run's ingest_runs row, on a fresh connection (the fetch's connection has been
+    open for the whole fetch), and a failed refresh step fails the run instead of only logging a
+    warning after the run was already recorded as ok."""
     with db.run_log(c, "precall_refetch" if refetch else "precall") as stats:
         stats["rows"] += (refetch_missing(k, c, limit) if refetch else fill(k, c, limit=limit))["candles"]
-    if refetch:
-        db.refresh_word_counts(c)
+        if refetch:
+            log.info("precall: refetch done, refreshing the materialized views")
+            with db.conn() as rc:
+                failed = db.refresh_word_counts(rc)
+            if failed:
+                raise RuntimeError(f"refresh after refetch failed: {', '.join(failed)}")
 
 
 # --------------------------------------------------------------------- upcoming calls
