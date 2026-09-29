@@ -38,6 +38,12 @@
                                        settled markets without hourly windows; resumable per series
   python -m kalshi_worker reactions [--days N]   1-minute candles around earnings press
                                        releases for mention markets (default 3; 90 for backfill)
+  python -m kalshi_worker news [--backfill]   pre-call Google News counts (Serper) per earnings-mention
+                                       market: company + word and company alone over the 14 days
+                                       before the call day, nothing at or after call start - 2h;
+                                       calls starting in 3h-3 days, or --backfill: settled markets
+                                       without a news_counts row, newest first; at most 2,000
+                                       requests per run; needs SERPER_API_KEY
   python -m kalshi_worker worker       always-on: snapshot every N minutes
 """
 import logging
@@ -50,7 +56,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("kalshi_worker")
 
-from . import db, equibles, filings, fortune, jobs, mentions, precall, reactions, transcripts  # noqa: E402  (after load_dotenv so DATABASE_URL is present)
+from . import db, equibles, filings, fortune, jobs, mentions, news, precall, reactions, transcripts  # noqa: E402  (after load_dotenv so DATABASE_URL is present)
 from .client import KalshiClient  # noqa: E402
 
 
@@ -111,6 +117,8 @@ def run(cmd: str, args: list[str] = ()) -> None:
             mentions.run(k, c)
         elif cmd == "precall":
             precall.run(k, c, limit=_opt("limit", list(args)), refetch="--refetch-missing" in args)
+        elif cmd == "news":
+            news.run(c, backfill="--backfill" in args)
         elif cmd == "reactions":
             reactions.run(k, c, days=_opt("days", list(args)) or reactions.DEFAULT_DAYS)
         else:
