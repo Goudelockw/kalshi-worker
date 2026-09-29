@@ -43,7 +43,13 @@
                                        before the call day, nothing at or after call start - 2h;
                                        calls starting in 3h-3 days, or --backfill: settled markets
                                        without a news_counts row, newest first; at most 2,000
-                                       requests per run; needs SERPER_API_KEY
+                                       requests per run; needs SERPER_API_KEY. New articles count
+                                       only after their page's publish time is verified (below),
+                                       which the run does for its own articles before it ends
+  python -m kalshi_worker news-dates [--limit N]   exact publish times for unverified news articles,
+                                       read from each page (JSON-LD, meta tags, <time> in <article>);
+                                       recomputes counted and news_counts; newest calls first;
+                                       5 pages/s overall, 1/s per domain
   python -m kalshi_worker worker       always-on: snapshot every N minutes
 """
 import logging
@@ -56,7 +62,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("kalshi_worker")
 
-from . import db, equibles, filings, fortune, jobs, mentions, news, precall, reactions, transcripts  # noqa: E402  (after load_dotenv so DATABASE_URL is present)
+from . import db, equibles, filings, fortune, jobs, mentions, news, news_dates, precall, reactions, transcripts  # noqa: E402  (after load_dotenv so DATABASE_URL is present)
 from .client import KalshiClient  # noqa: E402
 
 
@@ -119,6 +125,8 @@ def run(cmd: str, args: list[str] = ()) -> None:
             precall.run(k, c, limit=_opt("limit", list(args)), refetch="--refetch-missing" in args)
         elif cmd == "news":
             news.run(c, backfill="--backfill" in args)
+        elif cmd == "news-dates":
+            news_dates.run(c, limit=_opt("limit", list(args)))
         elif cmd == "reactions":
             reactions.run(k, c, days=_opt("days", list(args)) or reactions.DEFAULT_DAYS)
         else:
