@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import socket
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -222,29 +223,49 @@ def delete_state(c, job: str) -> int:
         return cur.rowcount
 
 
+REFRESH_VIEWS = (   # in dependency order; CONCURRENTLY where the view has a unique index
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_counts",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_call_stats",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_call_analysts",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_call_analyst_stats",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_analyst_features",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_call_features",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_call_execs",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_earnings_dates",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_exec_features",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_segment_tsv",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_corpus_hits",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_corpus",
+    "REFRESH MATERIALIZED VIEW kalshi.mv_call_times",
+    "REFRESH MATERIALIZED VIEW kalshi.mv_precall_prices",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_features",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_model_input",
+)
+REFRESH_TIMEOUT = "10min"
+
+
 def refresh_word_counts(c) -> None:
-    """kalshi.resolve_speaker_roles() (fills transcript_segments.role_resolved), then REFRESH
-    MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_counts; each step commits, and a failure in
-    either is logged, not raised."""
-    try:
-        c.commit()
-        with c.cursor() as cur:
-            cur.execute("SELECT kalshi.resolve_speaker_roles()")
-            n = cur.fetchone()[0]
-        c.commit()
-        log.info("resolved speaker roles (%s)", n)
-    except Exception as e:  # noqa: BLE001
-        c.rollback()
-        log.warning("kalshi.resolve_speaker_roles() failed: %s", e)
-    try:
-        c.commit()
-        with c.cursor() as cur:
-            cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_counts")
-        c.commit()
-        log.info("refreshed kalshi.mv_word_counts")
-    except Exception as e:  # noqa: BLE001
-        c.rollback()
-        log.warning("refresh of kalshi.mv_word_counts failed: %s", e)
+    """kalshi.resolve_speaker_roles() (fills transcript_segments.role_resolved), then every
+    materialized view in REFRESH_VIEWS, in order. Each statement runs in its own transaction
+    with SET LOCAL statement_timeout = 10min (so the timeout ends with it) and commits; its
+    elapsed seconds are logged, and a failure is logged and skipped, not raised."""
+    def step(label: str, sql: str):
+        t0 = time.monotonic()
+        try:
+            c.commit()
+            with c.cursor() as cur:
+                cur.execute(f"SET LOCAL statement_timeout = '{REFRESH_TIMEOUT}'")
+                cur.execute(sql)
+                out = cur.fetchone()[0] if cur.description else None
+            c.commit()
+            log.info("%s done in %.1fs%s", label, time.monotonic() - t0, f" ({out})" if out is not None else "")
+        except Exception as e:  # noqa: BLE001
+            c.rollback()
+            log.warning("%s failed after %.1fs: %s", label, time.monotonic() - t0, e)
+
+    step("kalshi.resolve_speaker_roles()", "SELECT kalshi.resolve_speaker_roles()")
+    for sql in REFRESH_VIEWS:
+        step(sql.replace("REFRESH MATERIALIZED VIEW ", "refresh "), sql)
 
 
 def watchlist(c) -> list[dict]:
