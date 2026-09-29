@@ -236,6 +236,7 @@ REFRESH_VIEWS = (   # in dependency order; CONCURRENTLY where the view has a uni
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_segment_tsv",
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_corpus_hits",
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_corpus",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_context",
     "REFRESH MATERIALIZED VIEW kalshi.mv_call_times",
     "REFRESH MATERIALIZED VIEW kalshi.mv_precall_prices",
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_features",
