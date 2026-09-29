@@ -3,25 +3,25 @@
 For each earnings-mention market: how many Google News articles mentioned the company and the
 market's word in the two weeks before the call (n_word_articles), next to how many mentioned the
 company at all (n_company_articles, one query per event). Nothing published at or after the call
-start may be counted, enforced three times:
+start may be counted:
 
 1. Query window: Serper's tbs=cdr:1,cd_min,cd_max (day-granular) over [call day - 14, call day - 1]
    in New York, the call day never included. The anchor is kalshi.mv_call_times.call_start_est;
    events without one are skipped (no close_time fallback).
-2. Each article's own date: Serper's `date` is parsed ("Mar 5, 2025" = 23:59 New York that day;
-   "3 days ago" = fetched_at minus the offset, months as 28 days so the estimate is never earlier
-   than the truth). Counted only if published_at < cutoff (call_start - 2h) and its New York date
-   is inside the window; unparseable -> 'no_date', past the window or cutoff -> 'after_cutoff',
-   before the window -> 'before_window'.
-3. Recap titles (earnings call, results, beats, guidance, shares jump ...) -> 'recap_title'.
-
-Every returned article goes to kalshi.news_articles (the company baseline under ticker
-'__company__' || event_ticker), counted or not; kalshi.news_counts holds the totals. Default run:
+2. Every returned article is stored in kalshi.news_articles (the company baseline under ticker
+   '__company__' || event_ticker) with counted = false, reject_reason = 'unverified'. Serper's own
+   `date` is mostly relative ("10 months ago") and sometimes a re-dated stale page, so it is kept
+   only for reference (date_raw, published_at: "Mar 5, 2025" = 23:59 New York that day, "3 days
+   ago" = fetched_at minus the offset).
+3. Before the run ends, news_dates.verify reads each new article's publish time from the page
+   itself and decides counted (exact time before call_start - 2h, inside the window, not a stale
+   re-date, not a recap title) and recomputes kalshi.news_counts once a market is fully checked
+   (dates_verified). Default run:
 markets whose call starts between now + 3h and now + 3 days. --backfill: settled markets with no
 news_counts row (or an errored one), newest calls first. A Serper error is stored in
 news_counts.error and retried next run; 401/403/429 or an out-of-credits answer stops the run.
-5 requests/s, at most MAX_REQUESTS per run. Every run ends with the leak self-check
-(counted and published_at >= cutoff must be 0; the run fails otherwise). Needs SERPER_API_KEY.
+5 Serper requests/s, at most MAX_REQUESTS per run. Every run ends with the leak self-check (counted
+without an exact time before the cutoff must be 0; the run fails otherwise). Needs SERPER_API_KEY.
 """
 from __future__ import annotations
 
@@ -29,7 +29,6 @@ import logging
 import os
 import re
 import time
-from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -174,23 +173,6 @@ def parse_date(raw: str | None, fetched_at: datetime) -> datetime | None:
     return datetime(d.year, d.month, d.day, 23, 59, tzinfo=NY)
 
 
-def classify(item: dict, fetched_at: datetime, window_start: date, window_end: date,
-             cutoff: datetime) -> tuple[datetime | None, bool, str | None]:
-    """One Serper article -> (published_at, counted, reject_reason)."""
-    published = parse_date(item.get("date"), fetched_at)
-    if published is None:
-        return None, False, "no_date"
-    day = published.astimezone(NY).date()
-    if published >= cutoff or day > window_end:
-        return published, False, "after_cutoff"
-    if day < window_start:
-        return published, False, "before_window"
-    if RECAP_RE.search(item.get("title") or ""):
-        return published, False, "recap_title"
-    assert published < cutoff
-    return published, True, None
-
-
 # ------------------------------------------------------------------------------ http
 class Serper:
     def __init__(self, api_key: str, http: httpx.Client | None = None, budget: int = MAX_REQUESTS,
@@ -259,20 +241,19 @@ def targets(c, backfill: bool) -> list[dict]:
 
 
 def store_articles(c, ticker: str, event_ticker: str, items: list[dict], fetched_at: datetime,
-                   call_start: datetime, win: tuple[date, date, datetime]) -> Counter:
-    """Replace `ticker`'s articles with this response's (deduplicated by URL) -> Counter of
-    'counted' and each reject reason."""
-    start, end, cutoff = win
-    rows, seen, tally = [], set(), Counter()
+                   call_start: datetime, win: tuple[date, date, datetime]) -> list[tuple[str, str]]:
+    """Replace `ticker`'s articles with this response's (deduplicated by URL), all unverified ->
+    the (ticker, url) keys stored. A URL already checked keeps its exact time and is reclassified by
+    news_dates without another request."""
+    cutoff = win[2]
+    rows, seen = [], set()
     for it in items:
         url = it.get("link") or it.get("url")
         if not url or url in seen:
             continue
         seen.add(url)
-        published, counted, reason = classify(it, fetched_at, start, end, cutoff)
-        tally[reason or "counted"] += 1
-        rows.append((ticker, event_ticker, url, it.get("title"), it.get("source"), it.get("date"), published,
-                     call_start, cutoff, counted, reason, fetched_at))
+        rows.append((ticker, event_ticker, url, it.get("title"), it.get("source"), it.get("date"),
+                     parse_date(it.get("date"), fetched_at), call_start, cutoff, False, "unverified", fetched_at))
     with c.cursor() as cur:
         cur.execute("DELETE FROM kalshi.news_articles WHERE ticker = %s AND NOT (url = ANY(%s))", (ticker, list(seen)))
         if rows:
@@ -285,7 +266,7 @@ def store_articles(c, ticker: str, event_ticker: str, items: list[dict], fetched
                      date_raw = EXCLUDED.date_raw, published_at = EXCLUDED.published_at,
                      call_start = EXCLUDED.call_start, cutoff = EXCLUDED.cutoff, counted = EXCLUDED.counted,
                      reject_reason = EXCLUDED.reject_reason, fetched_at = EXCLUDED.fetched_at""", rows)
-    return tally
+    return [(ticker, url) for url in seen]
 
 
 def stored_baseline(c, event_ticker: str, call_start: datetime) -> int | None:
@@ -303,25 +284,16 @@ def write_count(c, m: dict, query: str, win: tuple[date, date, datetime], n_word
         cur.execute(
             """INSERT INTO kalshi.news_counts (ticker, event_ticker, symbol, query, call_start, window_start,
                                                window_end, n_word_articles, n_company_articles, n_rejected,
-                                               fetched_at, error)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s)
+                                               fetched_at, error, dates_verified)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s, false)
                ON CONFLICT (ticker) DO UPDATE SET
                  event_ticker = EXCLUDED.event_ticker, symbol = EXCLUDED.symbol, query = EXCLUDED.query,
                  call_start = EXCLUDED.call_start, window_start = EXCLUDED.window_start,
                  window_end = EXCLUDED.window_end, n_word_articles = EXCLUDED.n_word_articles,
                  n_company_articles = EXCLUDED.n_company_articles, n_rejected = EXCLUDED.n_rejected,
-                 fetched_at = EXCLUDED.fetched_at, error = EXCLUDED.error""",
+                 fetched_at = EXCLUDED.fetched_at, error = EXCLUDED.error, dates_verified = false""",
             (m["ticker"], m["event_ticker"], m["symbol"], query, m["call_start"], win[0], win[1],
              n_word, n_company, n_rejected, error))
-
-
-def self_check(c) -> int:
-    with c.cursor() as cur:
-        cur.execute("select count(*) from kalshi.news_articles where counted and published_at >= cutoff")
-        n = cur.fetchone()[0]
-    c.commit()
-    (log.error if n else log.info)("news: self-check: %d counted articles published at or after the cutoff", n)
-    return n
 
 
 # ------------------------------------------------------------------------------ run
@@ -335,7 +307,8 @@ def _events(rows: list[dict]) -> list[list[dict]]:
     return out
 
 
-def fetch(c, api: Serper, backfill: bool, tally: Counter, stats: dict) -> None:
+def fetch(c, api: Serper, backfill: bool, stored: list[tuple[str, str]], stats: dict) -> None:
+    """Query Serper for the run's markets; the (ticker, url) keys stored are appended to `stored`."""
     rows = targets(c, backfill)
     events = _events(rows)
     written: set[str] = set()                 # markets whose news_counts row this run wrote
@@ -360,10 +333,10 @@ def fetch(c, api: Serper, backfill: bool, tally: Counter, stats: dict) -> None:
             if n_company is None:
                 try:
                     items, fetched_at = api.news(build_query(company), win[0], win[1])
-                    t = store_articles(c, COMPANY + ev, ev, items, fetched_at, call_start, win)
+                    keys = store_articles(c, COMPANY + ev, ev, items, fetched_at, call_start, win)
                     c.commit()
-                    tally.update(t)
-                    n_company = t["counted"]
+                    stored.extend(keys)
+                    n_company = 0                       # nothing counts until news_dates verifies it
                 except (RuntimeError, Fatal) as e:
                     c.rollback()
                     company_error = f"company baseline: {e}"[:1000]
@@ -386,11 +359,11 @@ def fetch(c, api: Serper, backfill: bool, tally: Counter, stats: dict) -> None:
                     if isinstance(e, Fatal):
                         raise
                     continue
-                t = store_articles(c, m["ticker"], ev, items, fetched_at, call_start, win)
-                write_count(c, m, query, win, t["counted"], n_company, sum(t.values()) - t["counted"], company_error)
+                keys = store_articles(c, m["ticker"], ev, items, fetched_at, call_start, win)
+                write_count(c, m, query, win, 0, n_company, len(keys), company_error)
                 c.commit()
                 written.add(m["ticker"])
-                tally.update(t)
+                stored.extend(keys)
                 stats["rows"] += 1
                 if company_error:
                     stats["errors"] += 1
@@ -404,28 +377,38 @@ def fetch(c, api: Serper, backfill: bool, tally: Counter, stats: dict) -> None:
             return
 
 
-def run(c, backfill: bool = False, api: Serper | None = None) -> None:
+def run(c, backfill: bool = False, api: Serper | None = None, http: httpx.Client | None = None) -> None:
+    """`http` is the page client handed to news_dates (tests)."""
+    from . import news_dates           # imports this module
+
     key = os.getenv("SERPER_API_KEY")
     if api is None and not key:
         raise SystemExit("news: SERPER_API_KEY is not set")
     api = api or Serper(key)
-    tally: Counter = Counter()
+    stored: list[tuple[str, str]] = []
     try:
         with db.run_log(c, "news_backfill" if backfill else "news") as stats:
             stats.update(done=0, errors=0)
-            failure = None
+            failure, dates = None, None
             try:
-                fetch(c, api, backfill, tally, stats)
-            except Exception as e:  # noqa: BLE001  (the self-check and summary still run)
+                fetch(c, api, backfill, stored, stats)
+            except Exception as e:  # noqa: BLE001  (verification, the self-check and summary still run)
                 c.rollback()
                 failure = e
-            leaked = self_check(c)
-            rejected = ", ".join(f"{k} {v}" for k, v in sorted(tally.items()) if k != "counted") or "none"
-            log.info("news: %d markets done, %d with errors, %d requests used, %d articles counted, rejected: %s",
-                     stats["done"], stats["errors"], api.used, tally["counted"], rejected)
+            log.info("news: %d markets done, %d with errors, %d requests used, %d articles stored; "
+                     "verifying their dates", stats["done"], stats["errors"], api.used, len(stored))
+            try:
+                if stored:
+                    dates = news_dates.verify(c, keys=stored, http=http)
+            except Exception as e:  # noqa: BLE001
+                c.rollback()
+                failure = failure or e
+            leaked = news_dates.self_check(c)
+            if dates:
+                log.info(news_dates.summary(dates))
             if leaked:
-                raise RuntimeError(f"news self-check failed: {leaked} counted articles published at or after "
-                                   "the cutoff")
+                raise RuntimeError(f"news self-check failed: {leaked} counted articles without an exact time "
+                                   "before the cutoff")
             if failure:
                 raise failure
     finally:
