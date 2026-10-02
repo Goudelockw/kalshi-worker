@@ -241,6 +241,10 @@ REFRESH_VIEWS = (   # in dependency order; CONCURRENTLY where the view has a uni
     "REFRESH MATERIALIZED VIEW kalshi.mv_precall_prices",
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_word_features",
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_model_input",
+    # context features (sql/014): cheap, so new markets pick them up right away. mv_last_speaker
+    # (~2.5 min) is refreshed by the weekly "Weekly context features" scheduled task instead.
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_market_context",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_phrasing",
 )
 REFRESH_TIMEOUT = "10min"
 
