@@ -3,13 +3,8 @@ and from this quarter's press release (only if filed before the call). Writes JS
 Usage: python valence_inputs.py <outdir> [--only-missing] [--horizon-days N] [--sample N] [--per-file N]
   --horizon-days N: only markets whose call is on or before today + N (label close to the call)."""
 import sys, json, os, math, random
-from nsql import q  # noqa
-outdir = sys.argv[1]; os.makedirs(outdir, exist_ok=True)
-only_missing = "--only-missing" in sys.argv
-lim = int(sys.argv[sys.argv.index("--limit")+1]) if "--limit" in sys.argv else None
-sample = int(sys.argv[sys.argv.index("--sample")+1]) if "--sample" in sys.argv else None
-horizon = int(sys.argv[sys.argv.index("--horizon-days")+1]) if "--horizon-days" in sys.argv else None
-per_file = int(sys.argv[sys.argv.index("--per-file")+1]) if "--per-file" in sys.argv else 250
+from concurrent.futures import ThreadPoolExecutor
+from nsql import q
 
 SQL = r"""
 with mk as (
@@ -56,37 +51,49 @@ from mk left join kalshi.company_map c on c.symbol = mk.symbol
 left join cxr on cxr.ticker = mk.ticker left join fx on fx.ticker = mk.ticker
 order by mk.symbol, mk.call_date_est, mk.ticker
 """
-tick = None
-if sample:
-    allt = [r["ticker"] for r in q("select ticker from kalshi.mv_word_counts where call_date_est is not null order by 1")]
-    random.seed(7); tick = random.sample(allt, sample)
-rows = []
-if tick is None:   # chunk by symbol to keep each query small
-    from concurrent.futures import ThreadPoolExecutor
-    allt = q("select symbol, ticker from kalshi.mv_word_counts where call_date_est is not null order by 1, 2")
-    chunks, cur = [], []
-    for r in allt:   # ~80 markets per query keeps each one well under the HTTP timeout
-        cur.append(r["ticker"])
-        if len(cur) >= 80: chunks.append(cur); cur = []
-    if cur: chunks.append(cur)
-    def run(tk): return q(SQL, [only_missing, tk, horizon])
-    with ThreadPoolExecutor(4) as ex:
-        for i, res in enumerate(ex.map(run, chunks)):
-            rows += res
-            if i % 10 == 0: print(f"chunk {i+1}/{len(chunks)}: {len(rows)} rows", flush=True)
-else:
-    rows = q(SQL, [only_missing, tick, horizon])
-if lim: rows = rows[:lim]
+
 def dedupe(items, key=lambda x: x):
     out = []
     for it in items:
         t = key(it)
         if not any(t[150:300] in key(o) or key(o)[150:300] in t for o in out): out.append(it)
     return out
-for r in rows:   # trim long excerpts, drop overlapping ones
-    r["prior_call_excerpts"] = dedupe([{"who": e["who"], "text": " ".join(e["text"].split())[:600]} for e in (r["prior_call_excerpts"] or [])], key=lambda e: e["text"])
-    r["release_excerpts"] = dedupe([" ".join(t.split())[:600] for t in (r["release_excerpts"] or [])])
-n = math.ceil(len(rows) / per_file) if rows else 0
-for i in range(n):
-    json.dump(rows[i*per_file:(i+1)*per_file], open(f"{outdir}/in_{i:02d}.json", "w"))
-print(len(rows), "rows in", n, "files")
+
+def build_rows(only_missing=False, tickers=None, horizon=None, missing_table="kalshi.word_valence"):
+    """Valence-style input rows. tickers=None means every market (queried in parallel chunks)."""
+    sql = SQL.replace("kalshi.word_valence", missing_table)
+    if tickers is None:
+        allt = [r["ticker"] for r in q("select ticker from kalshi.mv_word_counts where call_date_est is not null order by 1")]
+    else:
+        allt = list(tickers)
+    chunks = [allt[i:i+80] for i in range(0, len(allt), 80)]
+    rows = []
+    with ThreadPoolExecutor(4) as ex:
+        for i, res in enumerate(ex.map(lambda tk: q(sql, [only_missing, tk, horizon]), chunks)):
+            rows += res
+            if i % 10 == 0: print(f"chunk {i+1}/{len(chunks)}: {len(rows)} rows", flush=True)
+    for r in rows:   # trim long excerpts, drop overlapping ones
+        r["prior_call_excerpts"] = dedupe([{"who": e["who"], "text": " ".join(e["text"].split())[:600]} for e in (r["prior_call_excerpts"] or [])], key=lambda e: e["text"])
+        r["release_excerpts"] = dedupe([" ".join(t.split())[:600] for t in (r["release_excerpts"] or [])])
+    return rows
+
+def write_batches(rows, outdir, per_file):
+    os.makedirs(outdir, exist_ok=True)
+    n = math.ceil(len(rows) / per_file) if rows else 0
+    for i in range(n):
+        json.dump(rows[i*per_file:(i+1)*per_file], open(f"{outdir}/in_{i:02d}.json", "w"))
+    return n
+
+if __name__ == "__main__":
+    arg = lambda k, d=None: sys.argv[sys.argv.index(k)+1] if k in sys.argv else d
+    outdir = sys.argv[1]
+    only_missing = "--only-missing" in sys.argv
+    horizon = int(arg("--horizon-days")) if arg("--horizon-days") else None
+    sample = int(arg("--sample")) if arg("--sample") else None
+    per_file = int(arg("--per-file", 250))
+    tick = None
+    if sample:
+        allt = [r["ticker"] for r in q("select ticker from kalshi.mv_word_counts where call_date_est is not null order by 1")]
+        random.seed(7); tick = random.sample(allt, sample)
+    rows = build_rows(only_missing, tick, horizon)
+    print(len(rows), "rows in", write_batches(rows, outdir, per_file), "files")
