@@ -10,7 +10,6 @@ Per-market features, all known before the call starts. Everything lands in `kals
 | Last speaker | `ls_main_pos`, `ls_final_pos`, `ls_roles`, `ls_ceo`/`ls_cfo`/`ls_other_exec`/`ls_analyst`, `ls_n_speakers`, `ls_speakers_on_prev_call`, `ls_call_date`, `ls_calls_ago` | Speaker-tagged transcripts: the most recent prior call where anyone said the word → `mv_last_speaker` |
 | Phrasing risk | `n_alternatives`, `phrasing_risk` (0–2), `alt_hits_last4`, `word_hits_last4`, `alt_share_last4` | Claude lists non-settling ways to say the same thing (`rubrics/phrasing_v1.md`) → `kalshi.word_synonyms`; prior-call usage counted in `mv_phrasing` |
 | Valence | `valence` (−2..+2), `valence_mixed`, `valence_conf`, `valence_rationale` | Claude rates the topic for the company in that period from pre-call excerpts only (`rubrics/valence_v1.md`) → `kalshi.word_valence` |
-
 | Management incentive | `mgmt_incentive` (0–2: would management raise it unprompted?), `story_central` (0–2), `valence_prev` (topic's valence as of the previous call), `valence_change` | Claude labels from pre-call excerpts (`rubrics/incentive_v1.md`) → `kalshi.word_incentive` |
 | Release emphasis | `release_emphasis` (0 absent, 1 late, 2 first third, 3 headline/highlights), `release_mentions`, `release_first_pos` | This quarter's press release, only if filed before the call → `mv_incentive_features` |
 | New good news | `new_good_news` (valence ≥ 1 and not said on the last 2 calls), `valence_change_listing` | `mv_incentive_features` |
