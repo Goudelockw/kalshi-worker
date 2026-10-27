@@ -55,7 +55,21 @@ def _finish(c, rid: int, status: str, output: str) -> None:
 
 
 def run(run_command: Callable[[str, list[str]], None]) -> None:
-    """run_command is __main__.run, so each fix runs exactly as it would from the command line."""
+    """run_command is __main__.run, so each fix runs exactly as it would from the command line,
+    except that the refresh chain each command ends with is held back and run once at the end
+    (it takes ~2.5 min; nine fixes would otherwise run it nine times)."""
+    refresh, wanted = db.refresh_word_counts, []
+    db.refresh_word_counts = lambda c, skip_static=False: wanted.append(skip_static) or []
+    try:
+        _run(run_command)
+    finally:
+        db.refresh_word_counts = refresh
+    if wanted:
+        with db.conn() as c:
+            refresh(c, skip_static=all(wanted))
+
+
+def _run(run_command: Callable[[str, list[str]], None]) -> None:
     done = failed = rejected = 0
     with db.conn() as c, db.run_log(c, "ops-fixes") as stats:
         while (req := _claim(c)) is not None:
