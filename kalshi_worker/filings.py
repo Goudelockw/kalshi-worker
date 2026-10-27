@@ -508,7 +508,11 @@ def run(c, days: int = DEFAULT_DAYS, edgar: Edgar | None = None) -> None:
         uncovered = _uncovered(c, symbols)
         log.info("filings: coverage: %d tracked symbols with 0 filings%s", len(uncovered),
                  f": {', '.join(uncovered)}" if uncovered else "")
-    db.refresh_word_counts(c)
+    if new or ev_stored:
+        db.refresh_word_counts(c)
+        db.log_scores(c)   # a new release moves its call into ENTRY 2
+    else:
+        log.info("filings: nothing new stored; refresh skipped")
 
 
 def reset_backfill(c, symbol: str) -> None:

@@ -243,16 +243,23 @@ REFRESH_VIEWS = (   # in dependency order; CONCURRENTLY where the view has a uni
     "REFRESH MATERIALIZED VIEW CONCURRENTLY kalshi.mv_model_input",
 )
 REFRESH_TIMEOUT = "10min"
+# Steps that read only transcripts and filings (checked through pg_depend on 2026-10-27), so a run
+# that changed neither (the hourly sync) can skip them. resolve_speaker_roles() alone takes ~48s.
+STATIC_STEPS = frozenset({"resolve_speaker_roles", "mv_call_stats", "mv_call_analysts", "mv_call_analyst_stats",
+                          "mv_call_execs", "mv_earnings_dates", "mv_segment_tsv"})
 
 
-def refresh_word_counts(c) -> list[str]:
+def refresh_word_counts(c, skip_static: bool = False) -> list[str]:
     """kalshi.resolve_speaker_roles() (fills transcript_segments.role_resolved), then every
-    materialized view in REFRESH_VIEWS, in order. Each statement runs in its own transaction
-    with SET LOCAL statement_timeout = 10min (so the timeout ends with it) and commits; its
-    elapsed seconds are logged, and a failure is logged and skipped, not raised. Ends with a
-    summary line and returns the names of the steps that failed (empty when all succeeded)."""
+    materialized view in REFRESH_VIEWS, in order; with skip_static, the STATIC_STEPS are left out.
+    Each statement runs in its own transaction with SET LOCAL statement_timeout = 10min (so the
+    timeout ends with it) and commits; its elapsed seconds are logged, and a failure is logged and
+    skipped, not raised. Ends with a summary line and returns the names of the steps that failed
+    (empty when all succeeded)."""
     steps = [("resolve_speaker_roles", "SELECT kalshi.resolve_speaker_roles()")]
     steps += [(sql.rsplit(".", 1)[-1], sql) for sql in REFRESH_VIEWS]
+    if skip_static:
+        steps = [s for s in steps if s[0] not in STATIC_STEPS]
     failed: list[str] = []
     t_all = time.monotonic()
     log.info("refresh: starting %d steps", len(steps))
@@ -280,6 +287,27 @@ def refresh_word_counts(c) -> list[str]:
     else:
         log.info("refresh: all %d steps done in %.0fs", len(steps), time.monotonic() - t_all)
     return failed
+
+
+def log_scores(c) -> int | None:
+    """kalshi.log_model_scores(): snapshot the board's scores at the two entry points (24h before
+    the call, and after the release) so live trades can be graded. Upserts, so running it after
+    every refresh keeps the latest score inside each window. A failure is logged, not raised."""
+    try:
+        c.commit()
+        with c.cursor() as cur:
+            cur.execute("SELECT kalshi.log_model_scores()")
+            n = cur.fetchone()[0]
+        c.commit()
+        log.info("log_model_scores: %d rows", n)
+        return n
+    except Exception as e:  # noqa: BLE001
+        log.warning("log_model_scores failed: %s", e)
+        try:
+            c.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
 
 def watchlist(c) -> list[dict]:

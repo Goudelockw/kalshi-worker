@@ -320,7 +320,8 @@ def sync(k: KalshiClient, c, sweep_max: int = SWEEP_MAX, full: bool | None = Non
             c.commit()
         with _stage("sync", "stale sweep"):
             stats["rows"] += stale_sweep(k, c, seen, sweep_max, series=focus)
-        db.refresh_word_counts(c)
+        db.refresh_word_counts(c, skip_static=True)   # sync changes no transcripts or filings
+        db.log_scores(c)
 
 
 # --------------------------------------------------------------------------- snapshot
