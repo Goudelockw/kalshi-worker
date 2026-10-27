@@ -1,10 +1,9 @@
 """CLI entry point.
 
   python -m kalshi_worker backfill     one-time daily-candle backfill (resumable)
-  python -m kalshi_worker sync [--max N] [--full]   hourly refresh (Railway cron): focus series
-                                       (FOCUS_SERIES_PREFIXES + watchlist) except in the
-                                       FULL_SYNC_HOUR_UTC run or with --full, which covers
-                                       the whole exchange
+  python -m kalshi_worker sync [--max N] [--full]   hourly refresh (Railway cron): focus series only
+                                       (FOCUS_SERIES_PREFIXES, default KXEARNINGSMENTION, plus the
+                                       watchlist); --full covers the whole exchange
   python -m kalshi_worker reconcile [--max N]   nightly settlement lock (Railway cron)
   python -m kalshi_worker sweep [--max N]       just the stale sweep: re-fetch non-final
                                        markets via /markets?tickers=, least recently updated

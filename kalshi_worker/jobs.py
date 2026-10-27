@@ -173,13 +173,18 @@ def backfill(k: KalshiClient, c) -> None:
 # ------------------------------------------------------------------------------- sync
 OPEN = "status IN ('active','initialized','inactive')"
 
-# Hourly sync and nightly reconcile cover only the focus series: every series whose ticker starts
-# with one of FOCUS_SERIES_PREFIXES, plus the watchlist. The whole exchange is synced once a day,
-# in the sync run that starts in FULL_SYNC_HOUR_UTC (or with `sync --full`). Keeping all of
-# Kalshi current every hour kept Neon awake around the clock for markets nothing here uses.
+# Sync and reconcile cover only the focus series: every series whose ticker starts with one of
+# FOCUS_SERIES_PREFIXES (default: earnings mentions), plus the watchlist. Keeping all of Kalshi
+# current kept Neon awake around the clock for markets nothing here uses, so the database now
+# holds only focus markets. `sync --full` (or a FULL_SYNC_HOUR_UTC of 0-23) still covers the whole
+# exchange, and RECONCILE_ALL=1 widens reconcile the same way, for when other markets are wanted.
 FOCUS_SERIES_PREFIXES = tuple(p for p in os.getenv("FOCUS_SERIES_PREFIXES", "KXEARNINGSMENTION").split(",") if p)
-FULL_SYNC_HOUR_UTC = int(os.getenv("FULL_SYNC_HOUR_UTC", "9"))
+FULL_SYNC_HOUR_UTC = int(os.getenv("FULL_SYNC_HOUR_UTC", "-1"))
 RECONCILE_ALL = os.getenv("RECONCILE_ALL", "") == "1"
+
+
+def is_focus(series_ticker: str | None) -> bool:
+    return bool(series_ticker) and series_ticker.startswith(FOCUS_SERIES_PREFIXES)
 
 
 def focus_series(c) -> list[str]:
@@ -268,23 +273,20 @@ def sweep(k: KalshiClient, c, max_markets: int = SWEEP_MAX) -> None:
 
 
 def sync(k: KalshiClient, c, sweep_max: int = SWEEP_MAX, full: bool | None = None) -> None:
-    """Hourly: open events + markets; then, for open markets in watchlisted series only, recent
-    hourly candles, 1-minute candles (minute_candles) and new trades (trades); 3 hours of hourly
-    candles for open KXEARNINGSMENTION markets whose call is within 2 days; finally the stale
-    sweep over non-final markets that weren't in the open-events pull. Focus series only
-    (focus_series), except in the full run (FULL_SYNC_HOUR_UTC, or full=True), which also
-    refreshes the series list and covers the whole exchange."""
+    """Hourly: new focus series; open events + markets; then, for open markets in watchlisted
+    series only, recent hourly candles, 1-minute candles (minute_candles) and new trades (trades);
+    3 hours of hourly candles for open KXEARNINGSMENTION markets whose call is within 2 days;
+    finally the stale sweep over non-final markets that weren't in the open-events pull. Focus
+    series only (focus_series), except with full=True (or in FULL_SYNC_HOUR_UTC), which covers
+    every series on the exchange."""
     if full is None:
         full = _now().hour == FULL_SYNC_HOUR_UTC
     with db.run_log(c, "sync") as stats:
-        focus = None
-        if full:
-            with _stage("sync", "series"):
-                for page, _ in k.series():
-                    stats["rows"] += db.upsert_series(c, page)
-                c.commit()
-        else:
-            focus = focus_series(c)
+        with _stage("sync", "series"):
+            for page, _ in k.series():
+                stats["rows"] += db.upsert_series(c, page if full else [s for s in page if is_focus(s.get("ticker"))])
+            c.commit()
+        focus = None if full else focus_series(c)
 
         seen: set[str] = set()
         with _stage("sync", "open events" if full else f"open events ({len(focus)} focus series)"):
@@ -342,16 +344,17 @@ def snapshot(k: KalshiClient, c, interval_min: int = 5) -> None:
 # --------------------------------------------------------------------------- reconcile
 def reconcile(k: KalshiClient, c, sweep_max: int = SWEEP_MAX) -> None:
     """Nightly: daily candles over the full life of each focus-series market settled in the last
-    3 days (every series with RECONCILE_ALL=1); hourly too for markets in watchlisted series.
-    Then the exchange-wide stale sweep, which locks in status/result for markets that have closed
-    or settled, and the 48h pre-call hourly windows for earnings-mention markets settled in the
-    last 3 days (precall.fill)."""
+    3 days; hourly too for markets in watchlisted series. Then the stale sweep over focus series,
+    which locks in status/result for markets that have closed or settled, and the 48h pre-call
+    hourly windows for earnings-mention markets settled in the last 3 days (precall.fill).
+    RECONCILE_ALL=1 covers every series instead."""
     with db.run_log(c, "reconcile") as stats:
         since = _now() - timedelta(days=3)
-        if RECONCILE_ALL:
+        focus = None if RECONCILE_ALL else focus_series(c)
+        if focus is None:
             rows = _market_rows(c, "settled_time >= %s AND ticker NOT LIKE %s", (since, "KXMVE%"))
         else:
-            rows = _market_rows(c, "settled_time >= %s AND series_ticker = ANY(%s)", (since, focus_series(c)))
+            rows = _market_rows(c, "settled_time >= %s AND series_ticker = ANY(%s)", (since, focus))
         watched = {w["series_ticker"] for w in db.watchlist(c)}
         hourly = [m for m in rows if m["series_ticker"] in watched]
         for name, period, subset in (("daily", DAY, rows), ("hourly", HOUR, hourly)):
@@ -359,7 +362,7 @@ def reconcile(k: KalshiClient, c, sweep_max: int = SWEEP_MAX) -> None:
                 for (s, e), tickers in _life_windows(subset, period).items():
                     stats["rows"] += _batch_candles(k, c, tickers, period, s, e)
         with _stage("reconcile", "stale sweep"):
-            stats["rows"] += stale_sweep(k, c, max_markets=sweep_max)
+            stats["rows"] += stale_sweep(k, c, max_markets=sweep_max, series=focus)
         with _stage("reconcile", "pre-call hourly windows (settled 3d)"):
             from . import precall   # imports this module; deferred to avoid a cycle
             stats["rows"] += precall.fill(k, c, settled_days=3)["candles"]
