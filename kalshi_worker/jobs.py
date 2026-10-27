@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -172,6 +173,21 @@ def backfill(k: KalshiClient, c) -> None:
 # ------------------------------------------------------------------------------- sync
 OPEN = "status IN ('active','initialized','inactive')"
 
+# Hourly sync and nightly reconcile cover only the focus series: every series whose ticker starts
+# with one of FOCUS_SERIES_PREFIXES, plus the watchlist. The whole exchange is synced once a day,
+# in the sync run that starts in FULL_SYNC_HOUR_UTC (or with `sync --full`). Keeping all of
+# Kalshi current every hour kept Neon awake around the clock for markets nothing here uses.
+FOCUS_SERIES_PREFIXES = tuple(p for p in os.getenv("FOCUS_SERIES_PREFIXES", "KXEARNINGSMENTION").split(",") if p)
+FULL_SYNC_HOUR_UTC = int(os.getenv("FULL_SYNC_HOUR_UTC", "9"))
+RECONCILE_ALL = os.getenv("RECONCILE_ALL", "") == "1"
+
+
+def focus_series(c) -> list[str]:
+    with c.cursor() as cur:
+        cur.execute("SELECT ticker FROM series WHERE ticker LIKE ANY(%s) UNION SELECT series_ticker FROM watchlist",
+                    ([p + "%" for p in FOCUS_SERIES_PREFIXES],))
+        return sorted(r[0] for r in cur.fetchall())
+
 
 def _sync_events(k: KalshiClient, c, seen: set[str] | None = None, **params) -> int:
     """Page /events with nested markets; upsert each event row, then its markets with
@@ -205,10 +221,11 @@ SWEEP_CHUNK = 100
 FINAL = ("finalized", "settled")
 
 
-def stale_sweep(k: KalshiClient, c, seen: set[str] = frozenset(), max_markets: int = SWEEP_MAX) -> int:
+def stale_sweep(k: KalshiClient, c, seen: set[str] = frozenset(), max_markets: int = SWEEP_MAX,
+                series: list[str] | None = None) -> int:
     """Refresh markets that have dropped out of the open-events pull: every non-KXMVE market
-    whose status is not finalized/settled and that wasn't seen this run, least recently updated
-    first, up to `max_markets`. Fetched through GET /markets?tickers=... in chunks of 100 and
+    (only those in `series`, when given) whose status is not finalized/settled and that wasn't
+    seen this run, least recently updated first, up to `max_markets`. Fetched through GET /markets?tickers=... in chunks of 100 and
     upserted, so status, result, close/settlement time, settlement value and prices refresh.
     Tickers Kalshi doesn't return are left unchanged and counted. Returns rows written."""
     # anti-join on unnest(): `NOT (ticker = ANY(...))` with ~150k seen tickers is several times slower
@@ -217,8 +234,9 @@ def stale_sweep(k: KalshiClient, c, seen: set[str] = frozenset(), max_markets: i
             SELECT m.ticker FROM markets m
             WHERE coalesce(m.status, '') <> ALL(%s) AND coalesce(m.series_ticker, '') NOT LIKE %s
               AND NOT EXISTS (SELECT 1 FROM unnest(%s::text[]) s(t) WHERE s.t = m.ticker)
+              AND (%s::text[] IS NULL OR m.series_ticker = ANY(%s::text[]))
             ORDER BY m.updated_at ASC NULLS FIRST, m.ticker
-            LIMIT %s""", (list(FINAL), "KXMVE%", list(seen), max_markets))
+            LIMIT %s""", (list(FINAL), "KXMVE%", list(seen), series, series, max_markets))
         tickers = [r[0] for r in cur.fetchall()]
     n = missing = final = failed = 0
     for i in range(0, len(tickers), SWEEP_CHUNK):
@@ -249,20 +267,32 @@ def sweep(k: KalshiClient, c, max_markets: int = SWEEP_MAX) -> None:
         stats["rows"] += stale_sweep(k, c, max_markets=max_markets)
 
 
-def sync(k: KalshiClient, c, sweep_max: int = SWEEP_MAX) -> None:
-    """Hourly: series; open events + markets; then, for open markets in watchlisted series
-    only, recent hourly candles, 1-minute candles (minute_candles) and new trades (trades);
-    3 hours of hourly candles for open KXEARNINGSMENTION markets whose call is within 2 days;
-    finally the stale sweep over non-final markets that weren't in the open-events pull."""
+def sync(k: KalshiClient, c, sweep_max: int = SWEEP_MAX, full: bool | None = None) -> None:
+    """Hourly: open events + markets; then, for open markets in watchlisted series only, recent
+    hourly candles, 1-minute candles (minute_candles) and new trades (trades); 3 hours of hourly
+    candles for open KXEARNINGSMENTION markets whose call is within 2 days; finally the stale
+    sweep over non-final markets that weren't in the open-events pull. Focus series only
+    (focus_series), except in the full run (FULL_SYNC_HOUR_UTC, or full=True), which also
+    refreshes the series list and covers the whole exchange."""
+    if full is None:
+        full = _now().hour == FULL_SYNC_HOUR_UTC
     with db.run_log(c, "sync") as stats:
-        with _stage("sync", "series"):
-            for page, _ in k.series():
-                stats["rows"] += db.upsert_series(c, page)
-            c.commit()
+        focus = None
+        if full:
+            with _stage("sync", "series"):
+                for page, _ in k.series():
+                    stats["rows"] += db.upsert_series(c, page)
+                c.commit()
+        else:
+            focus = focus_series(c)
 
         seen: set[str] = set()
-        with _stage("sync", "open events"):
-            stats["rows"] += _sync_events(k, c, seen, status="open")
+        with _stage("sync", "open events" if full else f"open events ({len(focus)} focus series)"):
+            if full:
+                stats["rows"] += _sync_events(k, c, seen, status="open")
+            else:
+                for s in focus:
+                    stats["rows"] += _sync_events(k, c, seen, status="open", series_ticker=s)
 
         watch = db.watchlist(c)
         now = _now()
@@ -287,7 +317,7 @@ def sync(k: KalshiClient, c, sweep_max: int = SWEEP_MAX) -> None:
                 db.set_state(c, job, watermark=now - timedelta(minutes=10))
             c.commit()
         with _stage("sync", "stale sweep"):
-            stats["rows"] += stale_sweep(k, c, seen, sweep_max)
+            stats["rows"] += stale_sweep(k, c, seen, sweep_max, series=focus)
         db.refresh_word_counts(c)
 
 
@@ -311,13 +341,17 @@ def snapshot(k: KalshiClient, c, interval_min: int = 5) -> None:
 
 # --------------------------------------------------------------------------- reconcile
 def reconcile(k: KalshiClient, c, sweep_max: int = SWEEP_MAX) -> None:
-    """Nightly: daily candles over the full life of each market settled in the last 3 days;
-    hourly too for markets in watchlisted series. Then the stale sweep, which locks in
-    status/result for markets that have closed or settled, and the 48h pre-call hourly
-    windows for earnings-mention markets settled in the last 3 days (precall.fill)."""
+    """Nightly: daily candles over the full life of each focus-series market settled in the last
+    3 days (every series with RECONCILE_ALL=1); hourly too for markets in watchlisted series.
+    Then the exchange-wide stale sweep, which locks in status/result for markets that have closed
+    or settled, and the 48h pre-call hourly windows for earnings-mention markets settled in the
+    last 3 days (precall.fill)."""
     with db.run_log(c, "reconcile") as stats:
         since = _now() - timedelta(days=3)
-        rows = _market_rows(c, "settled_time >= %s AND ticker NOT LIKE %s", (since, "KXMVE%"))
+        if RECONCILE_ALL:
+            rows = _market_rows(c, "settled_time >= %s AND ticker NOT LIKE %s", (since, "KXMVE%"))
+        else:
+            rows = _market_rows(c, "settled_time >= %s AND series_ticker = ANY(%s)", (since, focus_series(c)))
         watched = {w["series_ticker"] for w in db.watchlist(c)}
         hourly = [m for m in rows if m["series_ticker"] in watched]
         for name, period, subset in (("daily", DAY, rows), ("hourly", HOUR, hourly)):

@@ -6,8 +6,8 @@ Ingests Kalshi market history into Neon Postgres (schema from `001_kalshi_schema
 | command | what | how it runs on Railway |
 |---|---|---|
 | `backfill` | daily candles for settled markets that have none yet; resumable | one-off (`railway run python -m kalshi_worker backfill`) |
-| `sync` | open events + markets, hourly candles, watchlist trades + 1-min candles, then the stale sweep (`--max N`, default 20000) | cron service, `0 * * * *` |
-| `reconcile` | complete candles for recently settled markets, then the stale sweep (`--max N`) | cron service, `15 4 * * *` |
+| `sync` | open events + markets, hourly candles, watchlist trades + 1-min candles, then the stale sweep (`--max N`, default 20000). Hourly runs cover only the focus series (every series starting with `FOCUS_SERIES_PREFIXES`, default `KXEARNINGSMENTION`, plus the watchlist); the run starting in `FULL_SYNC_HOUR_UTC` (default 9) or `sync --full` also refreshes `series` and covers the whole exchange | cron service, `0 * * * *` |
+| `reconcile` | complete daily candles for recently settled focus-series markets (every series with `RECONCILE_ALL=1`), then the exchange-wide stale sweep (`--max N`) | cron service, `15 4 * * *` |
 | `sweep` | only the stale sweep: re-fetch non-finalized/settled markets not in the open-events pull via `/markets?tickers=`, least recently updated first, up to `--max N` (default 20000) | one-off catch-up |
 | `transcripts` | discover new Motley Fool transcript URLs for companies with earnings-mention markets from the monthly sitemaps (`--discover-months N`, default 2; symbols never backfilled get 36 months once, marked by `transcripts_backfill:<SYMBOL>` in `sync_state`; `--backfill-symbol SYM` clears the marker so this run re-scans SYM), then fetch + parse pending ones into `transcripts` / `transcript_segments`; `--limit N` for testing; `--reparse` re-runs the parser on stored HTML for transcripts whose segments hold under 70% of their words or whose page date was never parsed; `sql/` holds the schema additions and the `v_transcript_mentions` base-rate view | on demand (`railway run python -m kalshi_worker transcripts`) |
 | `fortune` | Fortune.com (Quartr) transcripts as a second source (`source='fortune'`): finds `company_map.fortune_slug` for tracked companies without one (name-based candidates checked against the page's ticker; re-checked every 30 days), then stores new calls from each company's earnings reports as `transcripts` + speaker-merged `transcript_segments`; calls whose transcript isn't posted yet stay `pending` in `transcript_sources` and are retried; `--symbol SYM`, `--limit N` (report pages); 1 request/second | runs at the end of `transcripts`, or on demand |
@@ -28,7 +28,7 @@ Call start times (`kalshi.v_call_times_base` → `v_call_times` → `mv_call_tim
 1. Create the repo on GitHub, push this directory.
 2. In the `kalshi-data` project: **+ New → GitHub Repo** → this repo. Name the service `worker`. Uses the Dockerfile CMD.
 3. Add two more services from the same repo: `sync` (start command `python -m kalshi_worker sync`, cron `0 * * * *`) and `reconcile` (start command `python -m kalshi_worker reconcile`, cron `15 4 * * *`).
-4. Shared variables: `DATABASE_URL` (Neon pooled string with `?sslmode=require`), `SERPER_API_KEY` (for `news`), optionally `KALSHI_RPS`, `SNAPSHOT_INTERVAL_MIN`.
+4. Shared variables: `DATABASE_URL` (Neon pooled string with `?sslmode=require`), `SERPER_API_KEY` (for `news`), optionally `KALSHI_RPS`, `SNAPSHOT_INTERVAL_MIN`, `FOCUS_SERIES_PREFIXES` (comma-separated), `FULL_SYNC_HOUR_UTC`, `RECONCILE_ALL`.
 5. Kick off the backfill once from the `worker` service's shell or `railway run`.
 
 ## Local
