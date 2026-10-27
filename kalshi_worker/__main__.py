@@ -53,6 +53,11 @@
                                        recomputes counted and news_counts; newest calls first;
                                        5 pages/s overall, 1/s per domain
   python -m kalshi_worker worker       always-on: snapshot every N minutes
+  python -m kalshi_worker ops-fixes    run the fixes queued in ops.fix_requests by the weekly batch
+                                       (recursive-mentions-markets), one at a time, recording each
+                                       outcome; only an allowlist runs (ops_fixes.ALLOWED): sweep,
+                                       precall --refetch-missing, equibles, fortune --symbol SYM,
+                                       transcripts / filings --backfill-symbol SYM
 """
 import logging
 import os
@@ -148,4 +153,10 @@ def worker() -> None:
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "worker"
-    worker() if cmd == "worker" else run(cmd, sys.argv[2:])
+    if cmd == "worker":
+        worker()
+    elif cmd == "ops-fixes":
+        from . import ops_fixes
+        ops_fixes.run(run)
+    else:
+        run(cmd, sys.argv[2:])
