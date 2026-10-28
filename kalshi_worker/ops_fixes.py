@@ -27,6 +27,8 @@ ALLOWED: dict[str, Callable[[list[str]], bool]] = {
     "fortune": lambda a: len(a) == 2 and a[0] == "--symbol" and bool(SYMBOL.match(a[1])),
     "transcripts": lambda a: len(a) == 2 and a[0] == "--backfill-symbol" and bool(SYMBOL.match(a[1])),
     "filings": lambda a: len(a) == 2 and a[0] == "--backfill-symbol" and bool(SYMBOL.match(a[1])),
+    "reactions": lambda a: len(a) == 2 and a[0] == "--days" and a[1].isdigit() and 1 <= int(a[1]) <= 60,
+    "news": lambda a: a == ["--backfill"],
 }
 
 

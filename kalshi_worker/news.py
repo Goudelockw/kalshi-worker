@@ -217,10 +217,12 @@ class Serper:
 
 
 # ------------------------------------------------------------------------------ db
+# Upcoming calls come from v_upcoming_call_times: mv_call_times holds settled events only, so
+# reading it for the daily run found no markets (from Sep 29 to Oct 28 the run wrote 0 rows).
 TARGETS_SQL = """
 SELECT m.ticker, m.event_ticker, t.symbol, m.yes_sub_title, t.call_start_est, cm.name
 FROM kalshi.markets m
-JOIN kalshi.mv_call_times t ON t.event_ticker = m.event_ticker
+JOIN {times} t ON t.event_ticker = m.event_ticker
 LEFT JOIN kalshi.company_map cm ON cm.symbol = t.symbol
 WHERE m.series_ticker LIKE 'KXEARNINGSMENTION%%' AND t.call_start_est IS NOT NULL AND {where}
 ORDER BY t.call_start_est {order}, m.event_ticker, m.ticker
@@ -233,9 +235,10 @@ BACKFILL = ("m.result IN ('yes', 'no') AND NOT EXISTS (SELECT 1 FROM kalshi.news
 def targets(c, backfill: bool) -> list[dict]:
     with c.cursor() as cur:
         if backfill:
-            cur.execute(TARGETS_SQL.format(where=BACKFILL, order="DESC"))
+            cur.execute(TARGETS_SQL.format(times="kalshi.mv_call_times", where=BACKFILL, order="DESC"))
         else:
-            cur.execute(TARGETS_SQL.format(where=UPCOMING, order="ASC"), (UPCOMING_FROM, UPCOMING_TO))
+            cur.execute(TARGETS_SQL.format(times="kalshi.v_upcoming_call_times", where=UPCOMING, order="ASC"),
+                        (UPCOMING_FROM, UPCOMING_TO))
         cols = ("ticker", "event_ticker", "symbol", "yes_sub_title", "call_start", "name")
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 

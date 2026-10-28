@@ -367,3 +367,8 @@ def reconcile(k: KalshiClient, c, sweep_max: int = SWEEP_MAX) -> None:
         with _stage("reconcile", "pre-call hourly windows (settled 3d)"):
             from . import precall   # imports this module; deferred to avoid a cycle
             stats["rows"] += precall.fill(k, c, settled_days=3)["candles"]
+        # 1-minute candles around each release (logged as its own "reactions" run). mv_call_times
+        # reads them for first_lock, the most reliable call-start time; without them every call
+        # falls back to an estimate (they were only ever backfilled by hand, last on Sep 28).
+        from . import reactions   # imports this module; deferred to avoid a cycle
+        reactions.run(k, c, days=3)
